@@ -273,11 +273,12 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
   - [x] 实现 `src/models/gp/svgp_baseline.py`（CLI 与 NN/Tree 对齐）
   - [x] 支持核选择（RBF/Matérn）、ARD、诱导点初始化（kmeans/random）
   - [x] 小批量训练循环（预热→联合）与早停
-  - [ ] 学习率调度
+  - [x] 学习率调度
   - [x] 产物保存：`config.json`、`checkpoints`、`scaler_x.pkl`、`scaler_y.pkl`、`pca.pkl`、预测 CSV/图表
   - [x] 不确定性：保存 `std`、覆盖率、NLL、温度缩放 `τ`
-  - [ ] 推理：`src/models/gp/infer.py` 输出均值/方差
-  - [ ] 冒烟：小规模数据完整跑通并生成产物
+  - [x] 推理：`src/models/gp/infer.py` 输出均值/方差
+  - [x] 冒烟：小规模数据完整跑通并生成产物
+    - 运行 `experiments/svgp_baseline/2025-09-30_12-49-19`，`history.csv` 中学习率按余弦退火下降；`infer.py` 默认载入 `tau.json`（τ≈2.8683），验证 `tau` 缩放与 `--no-tau` 控制。
 
 - 测试
   - [x] 单元：列解析（`resolve_from_csvs` 正则/空/异常）

@@ -23,6 +23,7 @@ import pandas as pd
 import torch
 from sklearn.cluster import MiniBatchKMeans
 from torch.utils.data import DataLoader, TensorDataset
+from torch.optim import lr_scheduler
 
 from models.evaluation.report import EvaluationReport
 from models.gp.common import GPDataConfig, GPDataModule, PCAPipelineConfig
@@ -54,6 +55,10 @@ class CLIConfig:
     batch_size: int = 256
     epochs: int = 300
     lr: float = 1e-2
+    lr_decay: str = "none"
+    lr_decay_step: int = 100
+    lr_decay_gamma: float = 0.5
+    lr_decay_min_lr: float = 1e-4
     prewarm_epochs: int = 25
     early_stopping: bool = False
     patience: int = 50
@@ -116,6 +121,10 @@ def _parse_args() -> CLIConfig:
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--prewarm-epochs", type=int, default=25)
     parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--lr-decay", type=str, default="none", choices=["none", "step", "cosine"])
+    parser.add_argument("--lr-decay-step", type=int, default=100)
+    parser.add_argument("--lr-decay-gamma", type=float, default=0.5)
+    parser.add_argument("--lr-decay-min-lr", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--early-stopping", action="store_true")
@@ -198,6 +207,10 @@ def _parse_args() -> CLIConfig:
         epochs=args.epochs,
         prewarm_epochs=max(0, args.prewarm_epochs),
         lr=args.lr,
+        lr_decay=args.lr_decay,
+        lr_decay_step=max(1, args.lr_decay_step),
+        lr_decay_gamma=float(args.lr_decay_gamma),
+        lr_decay_min_lr=max(0.0, float(args.lr_decay_min_lr)),
         early_stopping=args.early_stopping,
         patience=max(1, args.patience),
         min_delta=float(args.min_delta),
@@ -260,6 +273,10 @@ def _apply_preset(cfg: CLIConfig) -> CLIConfig:
         "batch_size",
         "epochs",
         "lr",
+        "lr_decay",
+        "lr_decay_step",
+        "lr_decay_gamma",
+        "lr_decay_min_lr",
         "seed",
         "kernel",
         "ard",
@@ -413,6 +430,18 @@ def _set_prewarm_mode(
         likelihood.raw_noise.requires_grad = True
 
 
+def _build_scheduler(cfg: CLIConfig, optimizer: torch.optim.Optimizer) -> Optional[lr_scheduler._LRScheduler]:
+    if cfg.lr_decay == "none":
+        return None
+    if cfg.lr_decay == "step":
+        step_size = max(1, int(cfg.lr_decay_step))
+        return lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=float(cfg.lr_decay_gamma))
+    if cfg.lr_decay == "cosine":
+        t_max = max(1, int(cfg.epochs))
+        return lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=float(cfg.lr_decay_min_lr))
+    raise ValueError(f"Unsupported lr_decay mode '{cfg.lr_decay}'")
+
+
 class SingleTaskSVGP(gpytorch.models.ApproximateGP):
     """SVGP model for a single latent dimension."""
 
@@ -506,6 +535,7 @@ def _train_component(
         lr=cfg.lr,
     )
     mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=num_data)
+    scheduler = _build_scheduler(cfg, optimizer)
 
     prewarm_epochs = min(max(0, int(cfg.prewarm_epochs)), max(0, cfg.epochs - 1))
     prewarm_active = prewarm_epochs > 0
@@ -567,6 +597,11 @@ def _train_component(
         elif use_early_stopping and epoch > prewarm_epochs:
             epochs_no_improve += 1
 
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        if scheduler is not None:
+            scheduler.step()
+
         history.append(
             {
                 "component": float(component_idx),
@@ -574,11 +609,15 @@ def _train_component(
                 "train_elbo": avg_loss,
                 "val_rmse": float(val_rmse) if val_rmse is not None else float("nan"),
                 "prewarm": 1.0 if epoch <= prewarm_epochs else 0.0,
+                "lr": float(current_lr),
             }
         )
 
         if cfg.print_freq and epoch % cfg.print_freq == 0:
-            msg = f"Component {component_idx:02d} | epoch {epoch:04d} | train loss {avg_loss:.4f}"
+            msg = (
+                f"Component {component_idx:02d} | epoch {epoch:04d}"
+                f" | lr {current_lr:.5f} | train loss {avg_loss:.4f}"
+            )
             if val_rmse is not None:
                 msg += f" | val RMSE {val_rmse:.4f}"
             print(msg)
