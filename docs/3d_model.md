@@ -5,7 +5,7 @@
 ### 正模型
 
 ```bash
-uv run python src/models/rev03_rtd_nf_e3_enhanced.py \
+uv run python src/models/bridge_nn.py \
       --train-csv data/d3d04_all_train_r.csv \
       data/m2_0914_r_all_train.csv \
       data/m2_lhs_0916_train.csv \
