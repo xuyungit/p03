@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Mapping, Optional, Sequence
+from typing import Dict, Mapping, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -78,6 +78,20 @@ def scale_standard_deviation(
     return scaled
 
 
+QuantileKey = Union[str, float]
+
+
+def _normalize_level_mapping(mapping: Mapping[QuantileKey, float]) -> Dict[float, float]:
+    normalized: Dict[float, float] = {}
+    for key, value in mapping.items():
+        try:
+            level = float(key)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Quantile level keys must be convertible to float: got {key!r}") from exc
+        normalized[level] = float(value)
+    return normalized
+
+
 def _summarize_uncertainty(
     y_true: np.ndarray,
     y_pred: np.ndarray,
@@ -121,6 +135,102 @@ def _summarize_uncertainty(
     return {"nll": nll_summary, "coverage": coverage_summary}
 
 
+def _summarize_quantile_tau(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_std: np.ndarray,
+    tau_map: Mapping[float, float],
+    *,
+    coverage_levels: Sequence[float],
+    target_names: Sequence[str],
+    group_indices: Optional[Mapping[str, Sequence[int]]] = None,
+    level_weights: Optional[Mapping[float, float]] = None,
+) -> Dict[str, object]:
+    if not tau_map:
+        return {}
+
+    coverage_payload: Dict[str, object] = {}
+    nll_payload: Dict[str, object] = {}
+
+    errors: list[float] = []
+    weights: list[float] = []
+
+    weight_lookup: Dict[float, float] = {}
+    if level_weights is not None:
+        weight_lookup = {float(level): float(weight) for level, weight in level_weights.items()}
+
+    ordered_levels: list[float] = []
+    seen: set[float] = set()
+    for level in coverage_levels:
+        level_f = float(level)
+        if not 0.0 < level_f < 1.0:
+            continue
+        if level_f in tau_map and level_f not in seen:
+            ordered_levels.append(level_f)
+            seen.add(level_f)
+    for level in tau_map.keys():
+        level_f = float(level)
+        if not 0.0 < level_f < 1.0:
+            continue
+        if level_f not in seen:
+            ordered_levels.append(level_f)
+            seen.add(level_f)
+
+    for level in ordered_levels:
+        tau_value = tau_map[level]
+        scaled = scale_standard_deviation(y_std, global_tau=tau_value)
+        summary = _summarize_uncertainty(
+            y_true,
+            y_pred,
+            scaled,
+            [level],
+            target_names=target_names,
+            group_indices=group_indices,
+        )
+        level_key = f"{level:g}"
+        coverage_payload[level_key] = summary["coverage"][str(level)]
+        nll_payload[level_key] = summary["nll"]
+        overall_coverage = float(summary["coverage"][str(level)]["overall"])
+        errors.append(overall_coverage - level)
+        weights.append(weight_lookup.get(level, 1.0))
+
+    metrics: Dict[str, float] = {}
+    if errors:
+        weights_arr = np.asarray(weights, dtype=np.float64)
+        errors_arr = np.asarray(errors, dtype=np.float64)
+        total_weight = float(np.sum(weights_arr))
+        if total_weight <= 0.0:
+            weights_arr = np.ones_like(errors_arr)
+            total_weight = float(len(errors_arr))
+        mae = float(np.sum(np.abs(errors_arr) * weights_arr) / total_weight)
+        rmse = float(np.sqrt(np.sum((errors_arr ** 2) * weights_arr) / total_weight))
+        bias = float(np.sum(errors_arr * weights_arr) / total_weight)
+        max_abs = float(np.max(np.abs(errors_arr)))
+        metrics = {
+            "overall_mae": mae,
+            "overall_rmse": rmse,
+            "overall_bias": bias,
+            "max_abs_error": max_abs,
+        }
+
+    payload: Dict[str, object] = {
+        "values": {f"{level:g}": float(tau_map[level]) for level in ordered_levels},
+        "coverage": coverage_payload,
+        "nll": nll_payload,
+    }
+    if metrics:
+        payload["metrics"] = metrics
+    if weight_lookup:
+        payload["weights"] = {f"{level:g}": float(weight_lookup.get(level, 1.0)) for level in ordered_levels}
+
+    # Provide quick access to the objective deltas for reference / downstream use.
+    if errors:
+        payload["target_levels"] = [float(level) for level in ordered_levels]
+        payload["coverage_deltas"] = [float(err) for err in errors]
+
+    return payload
+
+
 def build_uncertainty_summary(
     true_df: pd.DataFrame,
     pred_df: pd.DataFrame,
@@ -130,6 +240,8 @@ def build_uncertainty_summary(
     global_tau: Optional[float] = None,
     per_group_tau: Optional[Mapping[str, float]] = None,
     group_indices: Optional[Mapping[str, Sequence[int]]] = None,
+    quantile_tau: Optional[Mapping[QuantileKey, float]] = None,
+    quantile_weights: Optional[Mapping[QuantileKey, float]] = None,
 ) -> Optional[Dict[str, object]]:
     """Assemble uncertainty diagnostics for raw and scaled predictions."""
 
@@ -183,6 +295,26 @@ def build_uncertainty_summary(
             ),
         }
 
+    if quantile_tau:
+        tau_map = _normalize_level_mapping(quantile_tau)
+        weights_map = (
+            _normalize_level_mapping(quantile_weights)
+            if quantile_weights is not None
+            else None
+        )
+        quantile_payload = _summarize_quantile_tau(
+            y_true,
+            y_pred,
+            y_std,
+            tau_map,
+            coverage_levels=coverage_levels,
+            target_names=targets,
+            group_indices=group_indices,
+            level_weights=weights_map,
+        )
+        if quantile_payload:
+            payload["quantile_tau_scaled"] = quantile_payload
+
     return payload
 
 
@@ -191,18 +323,46 @@ def _calibrate_tau_core(
     y_pred: np.ndarray,
     y_std: np.ndarray,
     coverage_levels: Sequence[float],
+    *,
+    level_weights: Optional[Sequence[float]] = None,
 ) -> Optional[float]:
-    levels = [level for level in coverage_levels if 0.0 < level < 1.0]
+    levels: list[float] = []
+    weights: list[float] = []
+
+    if level_weights is not None and len(level_weights) != len(coverage_levels):
+        raise ValueError(
+            "level_weights (if provided) must have the same length as coverage_levels"
+        )
+
+    for idx, level in enumerate(coverage_levels):
+        if not 0.0 < level < 1.0:
+            continue
+        weight = 1.0
+        if level_weights is not None:
+            weight = float(level_weights[idx])
+            if weight <= 0.0:
+                continue
+        levels.append(float(level))
+        weights.append(weight)
+
     if not levels:
         return None
+
+    weights_arr = np.asarray(weights, dtype=np.float64)
+    total_weight = float(np.sum(weights_arr))
+    if total_weight <= 0.0:
+        weights_arr = np.ones(len(levels), dtype=np.float64) / float(len(levels))
+    else:
+        weights_arr = weights_arr / total_weight
 
     def objective(tau_value: float) -> float:
         scaled = scale_standard_deviation(y_std, global_tau=tau_value)
         error = 0.0
-        for level in levels:
+        for level, weight in zip(levels, weights_arr):
             mask = _coverage_mask(y_true, y_pred, scaled, level)
             coverage = float(np.mean(mask))
-            error += (coverage - level) ** 2
+            diff = coverage - level
+            error += weight * diff * diff
         return error
 
     search_grid = np.logspace(-1, 1, num=60)
@@ -232,13 +392,21 @@ def calibrate_global_tau(
     pred_df: pd.DataFrame,
     std_df: Optional[pd.DataFrame],
     coverage_levels: Sequence[float],
+    *,
+    level_weights: Optional[Sequence[float]] = None,
 ) -> Optional[float]:
     if std_df is None or std_df.empty:
         return None
     y_true = true_df.to_numpy(dtype=np.float64, copy=False)
     y_pred = pred_df.to_numpy(dtype=np.float64, copy=False)
     y_std = std_df.to_numpy(dtype=np.float64, copy=False)
-    return _calibrate_tau_core(y_true, y_pred, y_std, coverage_levels)
+    return _calibrate_tau_core(
+        y_true,
+        y_pred,
+        y_std,
+        coverage_levels,
+        level_weights=level_weights,
+    )
 
 
 def calibrate_groupwise_tau(
@@ -247,6 +415,8 @@ def calibrate_groupwise_tau(
     std_df: Optional[pd.DataFrame],
     coverage_levels: Sequence[float],
     group_indices: Mapping[str, Sequence[int]],
+    *,
+    level_weights: Optional[Sequence[float]] = None,
 ) -> Dict[str, float]:
     if std_df is None or std_df.empty:
         return {}
@@ -258,7 +428,51 @@ def calibrate_groupwise_tau(
         sub_true = true_df.iloc[:, list(indices)]
         sub_pred = pred_df.iloc[:, list(indices)]
         sub_std = std_df.iloc[:, list(indices)]
-        tau = calibrate_global_tau(sub_true, sub_pred, sub_std, coverage_levels)
+        tau = calibrate_global_tau(
+            sub_true,
+            sub_pred,
+            sub_std,
+            coverage_levels,
+            level_weights=level_weights,
+        )
         if tau is not None:
             values[group] = tau
     return values
+
+
+def calibrate_quantile_tau_map(
+    true_df: pd.DataFrame,
+    pred_df: pd.DataFrame,
+    std_df: Optional[pd.DataFrame],
+    coverage_levels: Sequence[float],
+    *,
+    level_weights: Optional[Sequence[float]] = None,
+) -> Dict[float, float]:
+    if std_df is None or std_df.empty:
+        return {}
+
+    y_true = true_df.to_numpy(dtype=np.float64, copy=False)
+    y_pred = pred_df.to_numpy(dtype=np.float64, copy=False)
+    y_std = std_df.to_numpy(dtype=np.float64, copy=False)
+
+    if level_weights is not None and len(level_weights) != len(coverage_levels):
+        raise ValueError(
+            "level_weights (if provided) must have the same length as coverage_levels"
+        )
+
+    tau_values: Dict[float, float] = {}
+    for idx, level in enumerate(coverage_levels):
+        if not 0.0 < level < 1.0:
+            continue
+        if level_weights is not None and float(level_weights[idx]) <= 0.0:
+            continue
+        tau = _calibrate_tau_core(
+            y_true,
+            y_pred,
+            y_std,
+            [float(level)],
+            level_weights=[1.0],
+        )
+        if tau is not None:
+            tau_values[float(level)] = tau
+    return tau_values

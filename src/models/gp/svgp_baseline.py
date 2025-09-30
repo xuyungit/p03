@@ -37,6 +37,7 @@ from models.gp.uncertainty import (
     build_uncertainty_summary,
     calibrate_global_tau,
     calibrate_groupwise_tau,
+    calibrate_quantile_tau_map,
 )
 from models.utils import ColumnSpec
 
@@ -969,6 +970,7 @@ def main() -> None:
 
     tau_value: Optional[float] = None
     per_group_tau: Dict[str, float] = {}
+    quantile_tau: Dict[float, float] = {}
     if val_inputs is not None and val_latent is not None:
         val_mean_latent, val_var_latent = _predict_components(components, val_inputs, batch_size=cfg.batch_size, device=device)
         val_input_df, val_true_df, val_pred_df, val_std_df = _prepare_split_frames(
@@ -996,6 +998,12 @@ def main() -> None:
                 cfg.coverage_levels,
                 group_indices,
             )
+        quantile_tau = calibrate_quantile_tau_map(
+            val_true_df,
+            val_pred_df,
+            val_std_df,
+            cfg.coverage_levels,
+        )
         val_uncertainty = build_uncertainty_summary(
             val_true_df,
             val_pred_df,
@@ -1004,6 +1012,7 @@ def main() -> None:
             global_tau=tau_value,
             per_group_tau=per_group_tau,
             group_indices=group_indices,
+            quantile_tau=quantile_tau,
         )
         _write_uncertainty_metrics(run_dir, "val", val_uncertainty)
         if tau_value is not None:
@@ -1026,6 +1035,17 @@ def main() -> None:
                         "coverage_levels": [float(level) for level in cfg.coverage_levels],
                         "groups": group_mapping.to_serializable() if group_mapping is not None else {},
                         "mode": cfg.per_group_tau_mode,
+                    },
+                    handle,
+                    indent=2,
+                )
+        if quantile_tau:
+            with (run_dir / "quantile_tau.json").open("w") as handle:
+                json.dump(
+                    {
+                        "values": {f"{level:g}": float(value) for level, value in quantile_tau.items()},
+                        "source": "val",
+                        "coverage_levels": [float(level) for level in cfg.coverage_levels],
                     },
                     handle,
                     indent=2,
@@ -1059,6 +1079,7 @@ def main() -> None:
             global_tau=tau_value,
             per_group_tau=per_group_tau,
             group_indices=group_indices,
+            quantile_tau=quantile_tau,
         ),
     )
 
@@ -1097,6 +1118,7 @@ def main() -> None:
                     global_tau=tau_value,
                     per_group_tau=per_group_tau,
                     group_indices=group_indices,
+                    quantile_tau=quantile_tau,
                 ),
             )
 
