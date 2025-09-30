@@ -200,7 +200,7 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
 - 覆盖率：对每个样本/维度，统计 `[μ ± z_α σ]` 是否覆盖真实值；默认 α=1.64(90%)、1.96(95%)；输出总体覆盖率与分维覆盖率。
 - NLL：以高斯似然近似 `-log p(y|μ,σ)` 的均值（原单位）。
 - 温度缩放：在验证集搜索一个全局方差缩放系数 `τ`，使目标覆盖率更贴近名义值（保存 `tau.json`）。
-- 决策（2025-09-30）：推理阶段默认读取 `quantile_tau.json` 并生成对应分位数区间（下/上界），缺失时回退到单一 `τ` 缩放；同时保留原始 `std` 供自定义推导。
+- 决策（2025-09-30）：推理阶段默认读取 `quantile_tau.json` 并生成对应分位数区间（下/上界），缺失时回退到单一 `τ` 缩放；同时保留原始 `std` 供自定义推导。`infer.py` 新增 `--save-quantiles/--no-save-quantiles` 与 `--save-raw-std/--no-save-raw-std` 控制产物，`--quantile-mode` 可关闭分位数加载。
 - 当前 CLI 会生成 `*_uncertainty.json`（raw 与 `τ` 校准的覆盖率、NLL）及 `tau.json` 记录验证集标定结果。
 
 16. 与现有代码的对齐与复用
@@ -303,7 +303,7 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
   - [x] 将分组 τ 缩放融入 `svgp_baseline` 推理/评估（CLI 自动导出 `per_group_tau.json` 并在推理中加载）。
   - [x] 探索覆盖率目标权重化或多分位联合校准（如同时约束 0.9/0.95），对比 per-group τ 的效果。
     - `experiments/calibration_dev/runs/2025-09-30_19-58-24`：验证集 raw 覆盖率 0.36/0.39（0.9/0.95），全局 τ=4.14 后为 0.83/0.88，多分位 τ `{0.5: 3.63, 0.9: 5.36, 0.95: 4.95}` 将覆盖率拉至 0.91/0.94，对应误差 `overall_rmse≈0.012`；测试集亦由 0.38/0.44 提升至 0.93/0.95。
-  - [ ] 推理：默认输出 `quantile_tau.json` 对应分位区间（保留 `std`），CLI 需提供开关与输出格式（决策 2025-09-30）。
+  - [x] 推理：默认输出 `quantile_tau.json` 对应分位区间（保留 `std`），CLI 需提供开关与输出格式（2025-09-30 完成于 `infer.py`，新增 `--save-quantiles/--save-raw-std/--quantile-mode`）。
 
 - B 档：ICM/LMC 多任务（第二阶段）
   - [ ] 实现 `src/models/gp/mt_icm.py`（变分多任务）
