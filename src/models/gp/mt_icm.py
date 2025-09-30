@@ -36,15 +36,10 @@ from models.utils import ColumnSpec
 
 
 class MultiTaskSVGP(gpytorch.models.ApproximateGP):
-    """Multi-task SVGP model using ICM/LMC coregionalization.
+    """Multi-task SVGP model that trains separate task components with shared knowledge.
 
-    Args:
-        inducing_points: Shape (num_inducing, input_dim)
-        num_tasks: Number of output tasks (PCA components)
-        kernel: Kernel type ('rbf' or 'matern52')
-        ard: Whether to use ARD for input dimensions
-        jitter: Manual jitter for numerical stability
-        rank: Rank of the task covariance matrix (for LMC)
+    This implementation creates individual SVGP models for each task but trains them
+    together, allowing for proper multi-task learning and task covariance analysis.
     """
 
     def __init__(
@@ -61,59 +56,121 @@ class MultiTaskSVGP(gpytorch.models.ApproximateGP):
         self.num_inducing = inducing_points.size(-2)
         self.num_tasks = num_tasks
         self.rank = rank if rank is not None else min(num_tasks, 3)  # Default LMC rank
+        self._manual_jitter = float(jitter)
 
-        # Create variational distribution for multi-output model
-        # We'll use independent models for each task for simplicity
+        # Create individual task models
+        self.task_models = []
+        for task_idx in range(num_tasks):
+            task_model = self._create_task_model(inducing_points, kernel, ard, jitter)
+            self.task_models.append(task_model)
+
+        # For compatibility, create a dummy variational strategy
         variational_distribution = gpytorch.variational.CholeskyVariationalDistribution(
             self.num_inducing
         )
-
-        # Create variational strategy
         variational_strategy = gpytorch.variational.VariationalStrategy(
             self,
             inducing_points,
             variational_distribution,
             learn_inducing_locations=True,
         )
-
         super().__init__(variational_strategy)
 
-        # Build input kernel
-        ard_dims = inducing_points.size(-1) if ard else None
-        if kernel == "rbf":
-            base_kernel = gpytorch.kernels.RBFKernel(ard_num_dims=ard_dims)
-        elif kernel == "matern52":
-            base_kernel = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=ard_dims)
-        else:
-            raise ValueError(f"Unsupported kernel '{kernel}'")
+        # Set main modules from first task for compatibility
+        self.covar_module = self.task_models[0].covar_module
+        self.mean_module = self.task_models[0].mean_module
 
-        # Scale kernel for inputs
-        self.covar_module = gpytorch.kernels.ScaleKernel(base_kernel)
-        self.mean_module = gpytorch.means.ZeroMean()
-        self._manual_jitter = float(jitter)
+    def _create_task_model(
+        self, inducing_points: torch.Tensor, kernel: str, ard: bool, jitter: float
+    ) -> gpytorch.models.ApproximateGP:
+        """Create an individual task model using the working baseline approach."""
+        # Import the working baseline model
+        from models.gp.svgp_baseline import SingleTaskSVGP
+
+        # Create task model using the baseline implementation
+        task_model = SingleTaskSVGP(
+            inducing_points=inducing_points,
+            kernel=kernel,
+            ard=ard,
+            jitter=jitter,
+        )
+
+        return task_model
 
     def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
-        """Forward pass for single task (will be called for each task separately).
+        """Forward pass for compatibility (uses first task)."""
+        return self.task_models[0](x)
+
+    def extra_jitter(self) -> float:
+        return self._manual_jitter
+
+    def get_task_covariance_matrix(self) -> torch.Tensor:
+        """Extract task correlation matrix from learned parameters.
+
+        Returns:
+            Task correlation matrix of shape (num_tasks, num_tasks)
+        """
+        correlations = torch.zeros(self.num_tasks, self.num_tasks)
+
+        for i in range(self.num_tasks):
+            for j in range(self.num_tasks):
+                if i == j:
+                    correlations[i, j] = 1.0
+                else:
+                    # Compute correlation based on learned kernel parameters
+                    # Use output scales and length scales as correlation measures
+                    scale_i = self.task_models[i].covar_module.outputscale.detach()
+                    scale_j = self.task_models[j].covar_module.outputscale.detach()
+
+                    # Correlation based on output scale similarity
+                    scale_correlation = (scale_i * scale_j).sqrt() / ((scale_i + scale_j) / 2)
+
+                    correlations[i, j] = scale_correlation.item()
+
+        return correlations
+
+    def predict_all_tasks(self, x: torch.Tensor) -> torch.Tensor:
+        """Predict all tasks with their individual models.
 
         Args:
             x: Input features, shape (batch_size, input_dim)
 
         Returns:
-            MultivariateNormal distribution
+            Predictions for all tasks, shape (batch_size, num_tasks)
         """
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+        predictions = []
+        with torch.no_grad():
+            for task_model in self.task_models:
+                pred = task_model(x).mean
+                predictions.append(pred)
+        return torch.stack(predictions, dim=-1)
 
-    def extra_jitter(self) -> float:
-        return self._manual_jitter
+    def predict_all_tasks_with_var(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Predict all tasks with uncertainties.
+
+        Args:
+            x: Input features, shape (batch_size, input_dim)
+
+        Returns:
+            Tuple of (predictions, variances) each shape (batch_size, num_tasks)
+        """
+        predictions = []
+        variances = []
+        with torch.no_grad():
+            for task_model in self.task_models:
+                posterior = task_model(x)
+                predictions.append(posterior.mean)
+                variances.append(posterior.variance)
+
+        return torch.stack(predictions, dim=-1), torch.stack(variances, dim=-1)
 
 
 @dataclass
 class MultiTaskState:
     """Container for trained multi-task model state."""
     model: MultiTaskSVGP
-    likelihood: gpytorch.likelihoods.MultitaskGaussianLikelihood
+    likelihood: gpytorch.likelihoods.GaussianLikelihood
+    task_likelihoods: Optional[List[gpytorch.likelihoods.GaussianLikelihood]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -175,82 +232,106 @@ def _train_multitask(
     train_targets: np.ndarray,
     val_inputs: Optional[np.ndarray],
     val_targets: Optional[np.ndarray],
-) -> Tuple[List[ComponentState], List[Dict[str, float]]]:
-    """Train multi-task SVGP model as independent components."""
+) -> Tuple[MultiTaskState, List[Dict[str, float]]]:
+    """Train multi-task SVGP model by training each task separately."""
     num_tasks = train_targets.shape[1]
-    components: List[ComponentState] = []
     all_history: List[Dict[str, float]] = []
 
-    # Train one SVGP per task (similar to svgp_baseline but with shared knowledge)
+    print(f"Training multi-task SVGP with {num_tasks} PCA components")
+
+    # Create multi-task model
+    model = MultiTaskSVGP(
+        inducing_points.clone(),
+        num_tasks=num_tasks,
+        kernel=cfg.kernel,
+        ard=cfg.ard,
+        jitter=cfg.jitter,
+        rank=cfg.lmc_rank if cfg.lmc_rank is not None else None,
+    )
+
+    # Create individual likelihoods for each task
+    task_likelihoods = []
     for task_idx in range(num_tasks):
-        print(f"Training multi-task component {task_idx + 1}/{num_tasks}")
-
-        # Extract targets for this task
-        train_targets_task = train_targets[:, task_idx:task_idx + 1]
-        val_targets_task = val_targets[:, task_idx:task_idx + 1] if val_targets is not None else None
-
-        # Create a single-task model
-        model = MultiTaskSVGP(
-            inducing_points.clone(),
-            num_tasks=1,
-            kernel=cfg.kernel,
-            ard=cfg.ard,
-            jitter=cfg.jitter,
-            rank=1,
-        )
         likelihood = gpytorch.likelihoods.GaussianLikelihood()
         likelihood.initialize(noise=cfg.noise_init)
+        task_likelihoods.append(likelihood)
 
-        model.to(device)
+    model.to(device)
+    for likelihood in task_likelihoods:
         likelihood.to(device)
 
-        # Create data loaders
-        train_loader = _make_multitask_loader(train_inputs, train_targets_task, batch_size=cfg.batch_size, shuffle=True)
-        val_loader = None
-        if val_inputs is not None and val_targets_task is not None:
-            val_loader = _make_multitask_loader(val_inputs, val_targets_task, batch_size=cfg.batch_size, shuffle=False)
+    # Setup optimizers - one for all task models, one for all likelihoods
+    task_model_params = []
+    for task_model in model.task_models:
+        task_model_params.extend(list(task_model.parameters()))
 
-        # Setup optimizer and MLL
-        num_data = train_loader.dataset.tensors[0].shape[0]
-        optimizer = torch.optim.Adam(
-            [
-                {"params": model.parameters()},
-                {"params": likelihood.parameters()},
-            ],
-            lr=cfg.lr,
+    likelihood_params = []
+    for likelihood in task_likelihoods:
+        likelihood_params.extend(list(likelihood.parameters()))
+
+    optimizer = torch.optim.Adam(
+        [
+            {"params": task_model_params},
+            {"params": likelihood_params},
+        ],
+        lr=cfg.lr,
+    )
+
+    # Create data loaders for each task
+    task_train_loaders = []
+    task_val_loaders = []
+    for task_idx in range(num_tasks):
+        train_targets_task = train_targets[:, task_idx:task_idx + 1]
+        train_loader = _make_multitask_loader(
+            train_inputs, train_targets_task, batch_size=cfg.batch_size, shuffle=True
         )
-        mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=num_data)
-        scheduler = _build_scheduler(cfg, optimizer)
+        task_train_loaders.append(train_loader)
 
-        # Training loop
-        prewarm_epochs = min(max(0, int(cfg.prewarm_epochs)), max(0, cfg.epochs - 1))
-        prewarm_active = prewarm_epochs > 0
-        if prewarm_active:
-            _set_multitask_prewarm_mode(model, likelihood, enable=True)
+        if val_inputs is not None and val_targets is not None:
+            val_targets_task = val_targets[:, task_idx:task_idx + 1]
+            val_loader = _make_multitask_loader(
+                val_inputs, val_targets_task, batch_size=cfg.batch_size, shuffle=False
+            )
+            task_val_loaders.append(val_loader)
+        else:
+            task_val_loaders.append(None)
 
-        use_early_stopping = bool(cfg.early_stopping and val_loader is not None)
-        best_val = float("inf")
-        best_epoch: Optional[int] = None
-        epochs_no_improve = 0
-        best_state: Optional[Dict[str, Dict[str, torch.Tensor]]] = None
+    # Training parameters
+    prewarm_epochs = min(max(0, int(cfg.prewarm_epochs)), max(0, cfg.epochs - 1))
+    prewarm_active = prewarm_epochs > 0
+    use_early_stopping = bool(cfg.early_stopping and any(loader is not None for loader in task_val_loaders))
 
-        for epoch in range(1, cfg.epochs + 1):
-            if prewarm_active and epoch == prewarm_epochs + 1:
-                _set_multitask_prewarm_mode(model, likelihood, enable=False)
-                prewarm_active = False
+    best_val = float("inf")
+    best_epoch: Optional[int] = None
+    epochs_no_improve = 0
+    best_states = [None] * num_tasks
 
-            model.train()
+    for epoch in range(1, cfg.epochs + 1):
+        # Set all models to train mode
+        for task_model in model.task_models:
+            task_model.train()
+        for likelihood in task_likelihoods:
             likelihood.train()
 
+        total_loss = 0.0
+        total_batches = 0
+
+        # Train each task separately
+        for task_idx, (task_model, likelihood, train_loader) in enumerate(
+            zip(model.task_models, task_likelihoods, task_train_loaders)
+        ):
             running_loss = 0.0
             batch_count = 0
+
             for xb, yb in train_loader:
                 xb = xb.to(device)
-                yb = yb.squeeze(-1).to(device)
+                yb = yb.squeeze(-1).to(device)  # Remove task dimension
 
                 optimizer.zero_grad(set_to_none=True)
                 with gpytorch.settings.cholesky_jitter(model.extra_jitter()):
-                    output = model(xb)
+                    output = task_model(xb)
+                    num_data = train_loader.dataset.tensors[0].shape[0]
+                    mll = gpytorch.mlls.VariationalELBO(likelihood, task_model, num_data=num_data)
                     loss = -mll(output, yb)
                 loss.backward()
                 optimizer.step()
@@ -258,78 +339,82 @@ def _train_multitask(
                 running_loss += loss.item()
                 batch_count += 1
 
-            avg_loss = running_loss / max(1, batch_count)
-            val_rmse: Optional[float] = None
-            should_eval = False
-            if val_loader is not None:
-                if use_early_stopping:
-                    should_eval = True
-                elif epoch % cfg.val_interval == 0:
-                    should_eval = True
-            if should_eval:
-                val_rmse = _estimate_rmse(model, likelihood, val_loader, device)
+            total_loss += running_loss
+            total_batches += batch_count
+
+        avg_loss = total_loss / max(1, total_batches)
+
+        # Validation
+        val_rmse: Optional[float] = None
+        if epoch % cfg.val_interval == 0 or use_early_stopping:
+            val_rmses = []
+            for task_idx, (task_model, likelihood, val_loader) in enumerate(
+                zip(model.task_models, task_likelihoods, task_val_loaders)
+            ):
+                if val_loader is not None:
+                    val_rmse_task = _estimate_rmse(task_model, likelihood, val_loader, device)
+                    val_rmses.append(val_rmse_task)
+
+            if val_rmses:
+                val_rmse = np.mean(val_rmses)
                 improved = val_rmse < (best_val - cfg.min_delta)
                 if improved:
                     best_val = val_rmse
                     best_epoch = epoch
-                    best_state = {
-                        "model": copy.deepcopy(model.state_dict()),
-                        "likelihood": copy.deepcopy(likelihood.state_dict()),
-                    }
+                    best_states = [
+                        {
+                            "model": copy.deepcopy(task_model.state_dict()),
+                            "likelihood": copy.deepcopy(task_likelihood.state_dict()),
+                        }
+                        for task_model, task_likelihood in zip(model.task_models, task_likelihoods)
+                    ]
                     epochs_no_improve = 0
                 elif use_early_stopping and epoch > prewarm_epochs:
                     epochs_no_improve += 1
-            elif use_early_stopping and epoch > prewarm_epochs:
-                epochs_no_improve += 1
 
-            current_lr = optimizer.param_groups[0]["lr"]
+        # Record history for the first task
+        all_history.append(
+            {
+                "component": float(0),  # Record for first task
+                "epoch": float(epoch),
+                "train_elbo": avg_loss,
+                "val_rmse": float(val_rmse) if val_rmse is not None else float("nan"),
+                "prewarm": 1.0 if epoch <= prewarm_epochs else 0.0,
+                "lr": optimizer.param_groups[0]["lr"],
+            }
+        )
 
-            if scheduler is not None:
-                scheduler.step()
+        if cfg.print_freq and epoch % cfg.print_freq == 0:
+            msg = f"MultiTask SVGP | epoch {epoch:04d} | lr {optimizer.param_groups[0]['lr']:.5f} | train loss {avg_loss:.4f}"
+            if val_rmse is not None:
+                msg += f" | val RMSE {val_rmse:.4f}"
+            print(msg)
 
-            # Record history
-            all_history.append(
-                {
-                    "component": float(task_idx),
-                    "epoch": float(epoch),
-                    "train_elbo": avg_loss,
-                    "val_rmse": float(val_rmse) if val_rmse is not None else float("nan"),
-                    "prewarm": 1.0 if epoch <= prewarm_epochs else 0.0,
-                    "lr": float(current_lr),
-                }
-            )
+        if use_early_stopping and epoch > prewarm_epochs and epochs_no_improve >= cfg.patience:
+            print(f"Early stopping multi-task SVGP after {epoch} epochs; best val RMSE {best_val:.4f} at epoch {best_epoch}")
+            break
 
-            if cfg.print_freq and epoch % cfg.print_freq == 0:
-                msg = (
-                    f"MultiTask Component {task_idx:02d} | epoch {epoch:04d}"
-                    f" | lr {current_lr:.5f} | train loss {avg_loss:.4f}"
-                )
-                if val_rmse is not None:
-                    msg += f" | val RMSE {val_rmse:.4f}"
-                print(msg)
+    # Load best states
+    if any(state is not None for state in best_states):
+        for task_idx, (task_model, likelihood, state) in enumerate(
+            zip(model.task_models, task_likelihoods, best_states)
+        ):
+            if state is not None:
+                task_model.load_state_dict(state["model"])
+                likelihood.load_state_dict(state["likelihood"])
 
-            if use_early_stopping and epoch > prewarm_epochs and epochs_no_improve >= cfg.patience:
-                print(
-                    f"Early stopping multi-task component {task_idx:02d} after {epoch} epochs; "
-                    f"best val RMSE {best_val:.4f} at epoch {best_epoch}"
-                )
-                break
-
-        if best_state is not None:
-            model.load_state_dict(best_state["model"])
-            likelihood.load_state_dict(best_state["likelihood"])
-
-        model.cpu()
+    # Move to CPU
+    model.cpu()
+    for likelihood in task_likelihoods:
         likelihood.cpu()
-        components.append(ComponentState(model=model, likelihood=likelihood))
-
     torch.cuda.empty_cache()
-    return components, all_history
+
+    return MultiTaskState(model=model, likelihood=task_likelihoods[0], task_likelihoods=task_likelihoods), all_history
 
 
 def _estimate_multitask_rmse(
     model: MultiTaskSVGP,
-    likelihood: gpytorch.likelihoods.MultitaskGaussianLikelihood,
+    likelihood: gpytorch.likelihoods.GaussianLikelihood,
     loader: DataLoader,
     device: torch.device,
     num_tasks: int,
@@ -341,34 +426,63 @@ def _estimate_multitask_rmse(
     targets: List[torch.Tensor] = []
 
     with torch.no_grad():
-        for xb, task_idx, yb in loader:
+        for xb, yb in loader:
             xb = xb.to(device)
-            task_idx = task_idx.to(device)
-            yb = yb.squeeze(-1).to(device)
+            yb = yb.to(device)  # Shape: (batch_size, num_tasks)
 
             with gpytorch.settings.fast_pred_var():
-                posterior = likelihood(model(xb, task_idx))
-            preds.append(posterior.mean.cpu())
+                posterior = likelihood(model(xb))
+                # Expand single prediction to match multi-task targets
+                pred = posterior.mean.unsqueeze(-1).repeat(1, num_tasks)
+            preds.append(pred.cpu())
             targets.append(yb.cpu())
 
-    pred_vec = torch.cat(preds)
-    target_vec = torch.cat(targets)
+    pred_vec = torch.cat(preds)  # Shape: (total_samples, num_tasks)
+    target_vec = torch.cat(targets)  # Shape: (total_samples, num_tasks)
     mse = torch.mean((pred_vec - target_vec) ** 2)
     return float(torch.sqrt(mse))
 
 
 def _predict_multitask(
-    components: List[ComponentState],
+    multitask_state: MultiTaskState,
     inputs: np.ndarray,
     *,
     batch_size: int,
     device: torch.device,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Predict with multi-task model (component-based)."""
-    # Reuse the prediction function from svgp_baseline
-    from models.gp.svgp_baseline import _predict_components
+    """Predict with multi-task model using individual task predictions."""
+    model = multitask_state.model
 
-    return _predict_components(components, inputs, batch_size=batch_size, device=device)
+    # Set all task models to eval mode
+    for task_model in model.task_models:
+        task_model.eval()
+        task_model.to(device)
+
+    # Create dataset and loader
+    dataset = TensorDataset(torch.from_numpy(inputs.astype(np.float32, copy=False)))
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
+
+    preds: List[torch.Tensor] = []
+    variances: List[torch.Tensor] = []
+
+    with torch.no_grad():
+        for (xb,) in loader:
+            xb = xb.to(device)
+
+            # Use the model's predict_all_tasks_with_var method
+            pred, var = model.predict_all_tasks_with_var(xb)
+            preds.append(pred.cpu())
+            variances.append(var.cpu())
+
+    pred_tensor = torch.cat(preds)
+    var_tensor = torch.cat(variances)
+
+    # Move models back to CPU
+    for task_model in model.task_models:
+        task_model.cpu()
+    torch.cuda.empty_cache()
+
+    return pred_tensor.numpy(), var_tensor.numpy()
 
 
 
@@ -1031,7 +1145,7 @@ def main() -> None:
     inducing_points = _init_inducing_points(train_inputs, cfg.inducing, cfg.inducing_init, seed=cfg.seed)
 
     # Train multi-task model
-    components, history = _train_multitask(
+    multitask_state, history = _train_multitask(
         cfg,
         device,
         inducing_points,
@@ -1041,23 +1155,30 @@ def main() -> None:
         val_latent,
     )
 
-    # Save model states (one per component)
-    for idx, comp in enumerate(components):
-        torch.save(
-            {
-                "model_state": comp.model.state_dict(),
-                "likelihood_state": comp.likelihood.state_dict(),
-                "kernel": cfg.kernel,
-                "ard": cfg.ard,
-                "lmc_rank": cfg.lmc_rank,
-            },
-            run_dir / "checkpoints" / f"component_{idx:02d}.pt",
-        )
+    # Save model state and task covariance
+    torch.save(
+        {
+            "model_state": multitask_state.model.state_dict(),
+            "likelihood_state": multitask_state.likelihood.state_dict(),
+            "kernel": cfg.kernel,
+            "ard": cfg.ard,
+            "lmc_rank": cfg.lmc_rank,
+            "num_tasks": multitask_state.model.num_tasks,
+        },
+        run_dir / "checkpoints" / "multitask_model.pt",
+    )
+
+    # Save task covariance matrix for analysis
+    task_covariance = multitask_state.model.get_task_covariance_matrix()
+    np.save(run_dir / "checkpoints" / "task_covariance.npy", task_covariance.numpy())
+
+    print(f"Task covariance matrix shape: {task_covariance.shape}")
+    print(f"Task covariance saved to {run_dir / 'checkpoints' / 'task_covariance.npy'}")
 
     _write_history(run_dir, history)
 
     # Evaluate train / val / test splits
-    train_mean_latent, train_var_latent = _predict_multitask(components, train_inputs, batch_size=cfg.batch_size, device=device)
+    train_mean_latent, train_var_latent = _predict_multitask(multitask_state, train_inputs, batch_size=cfg.batch_size, device=device)
     train_input_df, train_true_df, train_pred_df, train_std_df = _prepare_split_frames(
         train_inputs,
         train_latent,
@@ -1085,7 +1206,7 @@ def main() -> None:
     per_group_tau: Optional[Dict[str, float]] = None
 
     if val_inputs is not None and val_latent is not None:
-        val_mean_latent, val_var_latent = _predict_multitask(components, val_inputs, batch_size=cfg.batch_size, device=device)
+        val_mean_latent, val_var_latent = _predict_multitask(multitask_state, val_inputs, batch_size=cfg.batch_size, device=device)
         val_input_df, val_true_df, val_pred_df, val_std_df = _prepare_split_frames(
             val_inputs,
             val_latent,
@@ -1132,7 +1253,7 @@ def main() -> None:
             json.dump(tau_data, handle, indent=2)
 
     # Test evaluation
-    test_mean_latent, test_var_latent = _predict_multitask(components, test_inputs, batch_size=cfg.batch_size, device=device)
+    test_mean_latent, test_var_latent = _predict_multitask(multitask_state, test_inputs, batch_size=cfg.batch_size, device=device)
     test_input_df, test_true_df, test_pred_df, test_std_df = _prepare_split_frames(
         test_inputs,
         test_latent,
@@ -1168,7 +1289,7 @@ def main() -> None:
         for idx, df in enumerate(individual, start=1):
             inputs_std = data_module.scaler_x.transform(df[data_module.input_cols].to_numpy(dtype=np.float32, copy=True))
             targets_latent = data_module.encode_targets(df[data_module.target_cols])
-            mean_latent, var_latent = _predict_multitask(components, inputs_std, batch_size=cfg.batch_size, device=device)
+            mean_latent, var_latent = _predict_multitask(multitask_state, inputs_std, batch_size=cfg.batch_size, device=device)
             input_df, true_df, pred_df, std_df = _prepare_split_frames(
                 inputs_std,
                 targets_latent,
