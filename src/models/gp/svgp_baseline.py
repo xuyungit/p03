@@ -1,0 +1,763 @@
+"""SVGP baseline training script using :class:`GPDataModule` for data handling.
+
+This CLI mirrors existing tabular model entrypoints (e.g. bridge_nn.py,
+rev03_rtd_nf_e3_tree.py) so that experiment directories and evaluation
+artifacts remain comparable across model families.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import gpytorch
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.cluster import MiniBatchKMeans
+from torch.utils.data import DataLoader, TensorDataset
+
+from models.evaluation.report import EvaluationReport
+from models.gp.common import GPDataConfig, GPDataModule, PCAPipelineConfig
+from models.utils import ColumnSpec
+
+
+# ---------------------------------------------------------------------------
+# CLI configuration & argument parsing
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class CLIConfig:
+    """Aggregated configuration parsed from CLI (optionally preset-backed)."""
+
+    train_csv: List[Path]
+    test_csv: List[Path]
+    val_ratio: float = 0.15
+    augment_flip: bool = True
+    augment_profile: Optional[str] = None
+    augment_config: Optional[Path] = None
+
+    input_cols: Optional[List[str]] = None
+    target_cols: Optional[List[str]] = None
+    input_cols_re: Optional[List[str]] = None
+    target_cols_re: Optional[List[str]] = None
+    preset: Optional[Path] = None
+
+    batch_size: int = 256
+    epochs: int = 300
+    lr: float = 1e-2
+    seed: int = 42
+    device: str = "cpu"
+
+    kernel: str = "rbf"
+    ard: bool = True
+    inducing: int = 500
+    inducing_init: str = "kmeans"
+    noise_init: float = 1e-3
+    jitter: float = 1e-6
+
+    save_std: bool = True
+    print_freq: int = 50
+    val_interval: int = 50
+
+    pca_enable: bool = True
+    pca_variance: float = 0.98
+    pca_components: Optional[int] = None
+    pca_max_components: Optional[int] = None
+
+    experiment_root: Optional[Path] = None
+
+    error_feature_names: Optional[List[str]] = None
+
+
+def _split_tokens(raw: Optional[str]) -> Optional[List[str]]:
+    if raw is None:
+        return None
+    tokens = [tok.strip() for tok in raw.replace("\n", ",").split(",")]
+    values = [tok for tok in tokens if tok]
+    return values or None
+
+
+def _maybe_path_list(value: object) -> List[Path]:
+    if isinstance(value, (list, tuple)):
+        return [Path(v) for v in value]
+    return [Path(value)]
+
+
+def _parse_args() -> CLIConfig:
+    parser = argparse.ArgumentParser(description="SVGP baseline for bridge mechanics")
+    parser.add_argument("--train-csv", type=Path, nargs="+", default=[Path("data/d03_all_train.csv")])
+    parser.add_argument("--test-csv", type=Path, nargs="+", default=[Path("data/d03_all_test.csv")])
+    parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", type=str, default="cpu")
+
+    parser.add_argument("--augment-flip", action="store_true")
+    parser.add_argument("--no-augment-flip", action="store_true")
+    parser.add_argument("--augment-profile", type=str, default=None)
+    parser.add_argument("--augment-config", type=Path, default=None)
+
+    parser.add_argument("--input-cols", type=str, default=None)
+    parser.add_argument("--target-cols", type=str, default=None)
+    parser.add_argument("--input-cols-re", type=str, default=None)
+    parser.add_argument("--target-cols-re", type=str, default=None)
+    parser.add_argument("--preset", type=Path, default=None)
+
+    parser.add_argument("--kernel", type=str, choices=["rbf", "matern52"], default="rbf")
+    parser.add_argument("--ard", action="store_true")
+    parser.add_argument("--no-ard", action="store_true")
+    parser.add_argument("--inducing", type=int, default=500)
+    parser.add_argument("--inducing-init", type=str, choices=["kmeans", "random"], default="kmeans")
+    parser.add_argument("--noise-init", type=float, default=1e-3)
+    parser.add_argument("--jitter", type=float, default=1e-6)
+
+    parser.add_argument("--save-std", action="store_true")
+    parser.add_argument("--no-save-std", action="store_true")
+    parser.add_argument("--print-freq", type=int, default=50)
+    parser.add_argument("--val-interval", type=int, default=50)
+
+    parser.add_argument("--no-pca", action="store_true")
+    parser.add_argument("--pca-variance", type=float, default=0.98)
+    parser.add_argument("--pca-components", type=int, default=None)
+    parser.add_argument("--pca-max-components", type=int, default=None)
+
+    parser.add_argument("--experiment-root", type=Path, default=None)
+    parser.add_argument("--error-features", type=str, nargs="*", default=None)
+
+    args = parser.parse_args()
+
+    augment_flip = True
+    if args.no_augment_flip:
+        augment_flip = False
+    elif args.augment_flip:
+        augment_flip = True
+
+    ard = True
+    if args.no_ard:
+        ard = False
+    elif args.ard:
+        ard = True
+
+    save_std = True
+    if args.no_save_std:
+        save_std = False
+    elif args.save_std:
+        save_std = True
+
+    cfg = CLIConfig(
+        train_csv=list(args.train_csv),
+        test_csv=list(args.test_csv),
+        val_ratio=args.val_ratio,
+        augment_flip=augment_flip,
+        augment_profile=args.augment_profile,
+        augment_config=args.augment_config,
+        input_cols=_split_tokens(args.input_cols),
+        target_cols=_split_tokens(args.target_cols),
+        input_cols_re=_split_tokens(args.input_cols_re),
+        target_cols_re=_split_tokens(args.target_cols_re),
+        preset=args.preset,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        lr=args.lr,
+        seed=args.seed,
+        device=args.device,
+        kernel=args.kernel,
+        ard=ard,
+        inducing=args.inducing,
+        inducing_init=args.inducing_init,
+        noise_init=args.noise_init,
+        jitter=args.jitter,
+        save_std=save_std,
+        print_freq=max(1, args.print_freq),
+        val_interval=max(1, args.val_interval),
+        pca_enable=not args.no_pca,
+        pca_variance=args.pca_variance,
+        pca_components=args.pca_components,
+        pca_max_components=args.pca_max_components,
+        experiment_root=args.experiment_root,
+        error_feature_names=args.error_features,
+    )
+    if cfg.preset is not None:
+        cfg = _apply_preset(cfg)
+    return cfg
+
+
+def _apply_preset(cfg: CLIConfig) -> CLIConfig:
+    try:
+        with cfg.preset.open("r") as handle:
+            payload = json.load(handle)
+    except Exception as exc:  # pragma: no cover - defensive logging
+        raise SystemExit(f"Failed to load preset {cfg.preset}: {exc}") from exc
+
+    updated = dataclass_replace(cfg)
+
+    if "train_csv" in payload:
+        updated.train_csv = _maybe_path_list(payload["train_csv"])
+    if "test_csv" in payload:
+        updated.test_csv = _maybe_path_list(payload["test_csv"])
+    if "val_ratio" in payload:
+        updated.val_ratio = float(payload["val_ratio"])
+    if "augment_flip" in payload:
+        updated.augment_flip = bool(payload["augment_flip"])
+    if "augment_profile" in payload and cfg.augment_profile is None:
+        updated.augment_profile = str(payload["augment_profile"])
+    if "augment_config" in payload and cfg.augment_config is None:
+        updated.augment_config = Path(payload["augment_config"])
+
+    if updated.input_cols is None and "input_cols" in payload:
+        updated.input_cols = [str(x) for x in payload["input_cols"]]
+    if updated.target_cols is None and "target_cols" in payload:
+        updated.target_cols = [str(x) for x in payload["target_cols"]]
+    if updated.input_cols_re is None and payload.get("input_cols_re"):
+        updated.input_cols_re = [str(x) for x in payload["input_cols_re"]]
+    if updated.target_cols_re is None and payload.get("target_cols_re"):
+        updated.target_cols_re = [str(x) for x in payload["target_cols_re"]]
+
+    for key in ("batch_size", "epochs", "lr", "seed", "kernel", "ard", "inducing", "inducing_init", "noise_init", "jitter", "pca_enable", "pca_variance", "pca_components", "pca_max_components"):
+        if key in payload:
+            setattr(updated, key, payload[key])
+    if "device" in payload and cfg.device == "cpu":
+        updated.device = str(payload["device"])
+    if "save_std" in payload:
+        updated.save_std = bool(payload["save_std"])
+    if "print_freq" in payload:
+        updated.print_freq = int(payload["print_freq"])
+    if "val_interval" in payload:
+        updated.val_interval = int(payload["val_interval"])
+    if "experiment_root" in payload and cfg.experiment_root is None:
+        updated.experiment_root = Path(payload["experiment_root"])
+    if updated.error_feature_names is None and payload.get("error_feature_names"):
+        updated.error_feature_names = [str(x) for x in payload["error_feature_names"]]
+
+    return updated
+
+
+def dataclass_replace(cfg: CLIConfig) -> CLIConfig:
+    return CLIConfig(**asdict(cfg))
+
+
+# ---------------------------------------------------------------------------
+# Training utilities
+# ---------------------------------------------------------------------------
+
+
+def _set_all_seeds(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _module_base_name() -> str:
+    return Path(__file__).stem
+
+
+def _default_experiment_root() -> Path:
+    return Path("experiments") / _module_base_name()
+
+
+def _start_run_dir(root: Path) -> Path:
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    run_dir = root / ts
+    (run_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
+    (run_dir / "plots").mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def _configure_matplotlib(run_dir: Path) -> None:
+    os.environ.setdefault("MPLCONFIGDIR", str(run_dir / ".mplconfig"))
+    (run_dir / ".mplconfig").mkdir(parents=True, exist_ok=True)
+    try:  # pragma: no cover - Matplotlib configuration best effort
+        import matplotlib as mpl
+
+        mpl.use("Agg")
+    except Exception:
+        pass
+
+
+def _init_inducing_points(
+    train_inputs: np.ndarray,
+    inducing: int,
+    method: str,
+    *,
+    seed: int,
+) -> torch.Tensor:
+    if inducing <= 0:
+        raise ValueError("Number of inducing points must be positive")
+    num_samples = train_inputs.shape[0]
+    if inducing > num_samples:
+        raise ValueError(
+            f"Requested {inducing} inducing points but only {num_samples} training samples available"
+        )
+    if method == "kmeans":
+        km = MiniBatchKMeans(n_clusters=inducing, batch_size=min(2048, num_samples), random_state=seed)
+        km.fit(train_inputs)
+        centers = km.cluster_centers_.astype(np.float32)
+    elif method == "random":
+        rng = np.random.default_rng(seed)
+        indices = rng.choice(num_samples, size=inducing, replace=False)
+        centers = train_inputs[indices].astype(np.float32)
+    else:  # pragma: no cover - validated by argparse choices
+        raise ValueError(f"Unsupported inducing init: {method}")
+    return torch.from_numpy(centers)
+
+
+class SingleTaskSVGP(gpytorch.models.ApproximateGP):
+    """SVGP model for a single latent dimension."""
+
+    def __init__(
+        self,
+        inducing_points: torch.Tensor,
+        *,
+        kernel: str,
+        ard: bool,
+        jitter: float,
+    ) -> None:
+        variational_distribution = gpytorch.variational.CholeskyVariationalDistribution(
+            inducing_points.size(-2)
+        )
+        variational_strategy = gpytorch.variational.VariationalStrategy(
+            self,
+            inducing_points,
+            variational_distribution,
+            learn_inducing_locations=True,
+        )
+        super().__init__(variational_strategy)
+
+        ard_dims = inducing_points.size(-1) if ard else None
+        if kernel == "rbf":
+            base_kernel = gpytorch.kernels.RBFKernel(ard_num_dims=ard_dims)
+        elif kernel == "matern52":
+            base_kernel = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=ard_dims)
+        else:  # pragma: no cover - guarded by argparse
+            raise ValueError(f"Unsupported kernel '{kernel}'")
+        self.mean_module = gpytorch.means.ZeroMean()
+        self.covar_module = gpytorch.kernels.ScaleKernel(base_kernel)
+        self._manual_jitter = float(jitter)
+
+    def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
+        mean_x = self.mean_module(x)
+        covar_x = self.covar_module(x)
+        return gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
+
+    def extra_jitter(self) -> float:
+        return self._manual_jitter
+
+
+@dataclass
+class ComponentState:
+    model: SingleTaskSVGP
+    likelihood: gpytorch.likelihoods.GaussianLikelihood
+
+
+def _make_loader(
+    inputs: np.ndarray,
+    targets: np.ndarray,
+    *,
+    batch_size: int,
+    shuffle: bool,
+) -> DataLoader:
+    ds = TensorDataset(
+        torch.from_numpy(inputs.astype(np.float32, copy=False)),
+        torch.from_numpy(targets.astype(np.float32, copy=False)),
+    )
+    return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
+
+
+def _train_component(
+    component_idx: int,
+    cfg: CLIConfig,
+    device: torch.device,
+    inducing_points: torch.Tensor,
+    train_inputs: np.ndarray,
+    train_targets: np.ndarray,
+    val_inputs: Optional[np.ndarray],
+    val_targets: Optional[np.ndarray],
+) -> Tuple[ComponentState, List[Dict[str, float]]]:
+    model = SingleTaskSVGP(inducing_points.clone(), kernel=cfg.kernel, ard=cfg.ard, jitter=cfg.jitter)
+    likelihood = gpytorch.likelihoods.GaussianLikelihood()
+    likelihood.initialize(noise=cfg.noise_init)
+
+    model.to(device)
+    likelihood.to(device)
+
+    train_loader = _make_loader(train_inputs, train_targets, batch_size=cfg.batch_size, shuffle=True)
+    val_loader = None
+    if val_inputs is not None and val_targets is not None:
+        val_loader = _make_loader(val_inputs, val_targets, batch_size=cfg.batch_size, shuffle=False)
+
+    num_data = train_loader.dataset.tensors[0].shape[0]
+    optimizer = torch.optim.Adam(
+        [
+            {"params": model.parameters()},
+            {"params": likelihood.parameters()},
+        ],
+        lr=cfg.lr,
+    )
+    mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=num_data)
+
+    history: List[Dict[str, float]] = []
+    for epoch in range(1, cfg.epochs + 1):
+        model.train()
+        likelihood.train()
+
+        running_loss = 0.0
+        batch_count = 0
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.squeeze(-1).to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            with gpytorch.settings.cholesky_jitter(model.extra_jitter()):
+                output = model(xb)
+                loss = -mll(output, yb)
+            loss.backward()
+            optimizer.step()
+
+            running_loss += loss.item()
+            batch_count += 1
+
+        avg_loss = running_loss / max(1, batch_count)
+        val_rmse: Optional[float] = None
+        if val_loader is not None and epoch % cfg.val_interval == 0:
+            val_rmse = _estimate_rmse(model, likelihood, val_loader, device)
+
+        history.append(
+            {
+                "component": float(component_idx),
+                "epoch": float(epoch),
+                "train_elbo": avg_loss,
+                "val_rmse": float(val_rmse) if val_rmse is not None else float("nan"),
+            }
+        )
+
+        if cfg.print_freq and epoch % cfg.print_freq == 0:
+            msg = f"Component {component_idx:02d} | epoch {epoch:04d} | train loss {avg_loss:.4f}"
+            if val_rmse is not None:
+                msg += f" | val RMSE {val_rmse:.4f}"
+            print(msg)
+
+    model.cpu()
+    likelihood.cpu()
+    torch.cuda.empty_cache()
+    return ComponentState(model=model, likelihood=likelihood), history
+
+
+def _estimate_rmse(
+    model: SingleTaskSVGP,
+    likelihood: gpytorch.likelihoods.GaussianLikelihood,
+    loader: DataLoader,
+    device: torch.device,
+) -> float:
+    model.eval()
+    likelihood.eval()
+    preds: List[torch.Tensor] = []
+    targets: List[torch.Tensor] = []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device)
+            yb = yb.squeeze(-1).to(device)
+            with gpytorch.settings.fast_pred_var():
+                posterior = likelihood(model(xb))
+            preds.append(posterior.mean.cpu())
+            targets.append(yb.cpu())
+    pred_vec = torch.cat(preds)
+    target_vec = torch.cat(targets)
+    mse = torch.mean((pred_vec - target_vec) ** 2)
+    return float(torch.sqrt(mse))
+
+
+def _predict_components(
+    components: Sequence[ComponentState],
+    inputs: np.ndarray,
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> Tuple[np.ndarray, np.ndarray]:
+    num_samples = inputs.shape[0]
+    latent_dim = len(components)
+    mean_out = np.zeros((num_samples, latent_dim), dtype=np.float64)
+    var_out = np.zeros((num_samples, latent_dim), dtype=np.float64)
+
+    loader = _make_loader(inputs, np.zeros((num_samples, 1), dtype=np.float32), batch_size=batch_size, shuffle=False)
+
+    for comp_idx, comp in enumerate(components):
+        model = comp.model.to(device)
+        likelihood = comp.likelihood.to(device)
+        model.eval()
+        likelihood.eval()
+
+        preds: List[torch.Tensor] = []
+        vars_: List[torch.Tensor] = []
+        with torch.no_grad():
+            for xb, _ in loader:
+                xb = xb.to(device)
+                with gpytorch.settings.fast_pred_var(), gpytorch.settings.cholesky_jitter(model.extra_jitter()):
+                    posterior = likelihood(model(xb))
+                preds.append(posterior.mean.detach().cpu())
+                vars_.append(posterior.variance.detach().cpu())
+        mean_out[:, comp_idx] = torch.cat(preds).numpy()
+        var_out[:, comp_idx] = torch.cat(vars_).numpy()
+        model.cpu()
+        likelihood.cpu()
+    torch.cuda.empty_cache()
+    return mean_out.astype(np.float64), var_out.astype(np.float64)
+
+
+# ---------------------------------------------------------------------------
+# Evaluation helpers
+# ---------------------------------------------------------------------------
+
+
+def _save_config(
+    run_dir: Path,
+    cfg: CLIConfig,
+    input_cols: Sequence[str],
+    target_cols: Sequence[str],
+) -> None:
+    cfg_dict = asdict(cfg)
+    cfg_dict["train_csv"] = [str(p) for p in cfg.train_csv]
+    cfg_dict["test_csv"] = [str(p) for p in cfg.test_csv]
+    if cfg.augment_config is not None:
+        cfg_dict["augment_config"] = str(cfg.augment_config)
+    if cfg.experiment_root is not None:
+        cfg_dict["experiment_root"] = str(cfg.experiment_root)
+    cfg_dict["resolved_input_cols"] = list(input_cols)
+    cfg_dict["resolved_target_cols"] = list(target_cols)
+    with (run_dir / "config.json").open("w") as handle:
+        json.dump(cfg_dict, handle, indent=2)
+
+
+def _write_history(run_dir: Path, history_rows: List[Dict[str, float]]) -> None:
+    if not history_rows:
+        return
+    df = pd.DataFrame(history_rows)
+    df.to_csv(run_dir / "history.csv", index=False)
+
+
+def _prepare_split_frames(
+    inputs_std: np.ndarray,
+    true_latent: np.ndarray,
+    pred_latent: np.ndarray,
+    pred_var_latent: np.ndarray,
+    data_module: GPDataModule,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Optional[pd.DataFrame]]:
+    scaler_x = data_module.scaler_x
+    inv_inputs = scaler_x.inverse_transform(inputs_std)
+    input_df = pd.DataFrame(inv_inputs, columns=data_module.input_cols)
+
+    true_orig = data_module.decode_targets(true_latent)
+    pred_orig = data_module.decode_targets(pred_latent)
+    true_df = pd.DataFrame(true_orig, columns=data_module.target_cols)
+    pred_df = pd.DataFrame(pred_orig, columns=data_module.target_cols)
+
+    std_df: Optional[pd.DataFrame] = None
+    if pred_var_latent is not None:
+        projected = data_module.project_latent_variance(pred_var_latent)
+        projected = np.maximum(projected, 0.0)
+        std_df = pd.DataFrame(np.sqrt(projected), columns=data_module.target_cols)
+
+    return input_df, true_df, pred_df, std_df
+
+
+def _save_report(
+    run_dir: Path,
+    split_name: str,
+    input_df: pd.DataFrame,
+    true_df: pd.DataFrame,
+    pred_df: pd.DataFrame,
+    *,
+    std_df: Optional[pd.DataFrame],
+    error_feature_names: Optional[Sequence[str]],
+) -> None:
+    report = EvaluationReport(model_name=f"svgp_{split_name}")
+    report.evaluate(true_df, pred_df)
+    report.save_artifacts(
+        str(run_dir),
+        split_name=split_name,
+        y_true_df=true_df,
+        y_pred_df=pred_df,
+        X_df=input_df,
+        error_feature_names=list(error_feature_names) if error_feature_names else None,
+    )
+    if std_df is not None:
+        std_df.to_csv(run_dir / f"{split_name}_pred_std.csv", index=False)
+
+
+# ---------------------------------------------------------------------------
+# Main execution flow
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    cfg = _parse_args()
+    _set_all_seeds(cfg.seed)
+
+    device = torch.device(cfg.device)
+    root = cfg.experiment_root or _default_experiment_root()
+    run_dir = _start_run_dir(root)
+    _configure_matplotlib(run_dir)
+
+    input_spec = ColumnSpec(names=cfg.input_cols, patterns=cfg.input_cols_re)
+    target_spec = ColumnSpec(names=cfg.target_cols, patterns=cfg.target_cols_re)
+
+    pca_cfg = PCAPipelineConfig(
+        n_components=cfg.pca_components,
+        variance_threshold=cfg.pca_variance,
+        max_components=cfg.pca_max_components,
+    )
+
+    data_cfg = GPDataConfig(
+        train_csv=cfg.train_csv,
+        test_csv=cfg.test_csv,
+        input_spec=input_spec,
+        target_spec=target_spec,
+        val_ratio=cfg.val_ratio,
+        batch_size=cfg.batch_size,
+        augment_flip=cfg.augment_flip,
+        augment_profile=cfg.augment_profile,
+        augment_config=cfg.augment_config,
+        use_pca=cfg.pca_enable,
+        pca=pca_cfg,
+    )
+
+    data_module = GPDataModule(data_cfg)
+    data_module.setup()
+    data_module.save_preprocessors(run_dir / "checkpoints")
+
+    _save_config(run_dir, cfg, data_module.input_cols, data_module.target_cols)
+
+    train_inputs, train_latent = data_module.train_arrays()
+    val_arrays = data_module.val_arrays()
+    if val_arrays is not None:
+        val_inputs, val_latent = val_arrays
+    else:
+        val_inputs = val_latent = None
+    test_inputs, test_latent = data_module.test_arrays()
+
+    inducing_points = _init_inducing_points(train_inputs, cfg.inducing, cfg.inducing_init, seed=cfg.seed)
+    components: List[ComponentState] = []
+    history_rows: List[Dict[str, float]] = []
+    latent_dim = train_latent.shape[1]
+
+    for idx in range(latent_dim):
+        state, history = _train_component(
+            idx,
+            cfg,
+            device,
+            inducing_points,
+            train_inputs,
+            train_latent[:, idx : idx + 1],
+            val_inputs if val_inputs is not None else None,
+            val_latent[:, idx : idx + 1] if val_latent is not None else None,
+        )
+        components.append(state)
+        history_rows.extend(history)
+        torch.save(
+            {
+                "model_state": state.model.state_dict(),
+                "likelihood_state": state.likelihood.state_dict(),
+                "kernel": cfg.kernel,
+                "ard": cfg.ard,
+            },
+            run_dir / "checkpoints" / f"component_{idx:02d}.pt",
+        )
+
+    _write_history(run_dir, history_rows)
+
+    # Evaluate train / val / test splits
+    train_mean_latent, train_var_latent = _predict_components(components, train_inputs, batch_size=cfg.batch_size, device=device)
+    train_input_df, train_true_df, train_pred_df, train_std_df = _prepare_split_frames(
+        train_inputs,
+        train_latent,
+        train_mean_latent,
+        train_var_latent,
+        data_module,
+    )
+    _save_report(
+        run_dir,
+        "train",
+        train_input_df,
+        train_true_df,
+        train_pred_df,
+        std_df=train_std_df if cfg.save_std else None,
+        error_feature_names=cfg.error_feature_names,
+    )
+
+    if val_inputs is not None and val_latent is not None:
+        val_mean_latent, val_var_latent = _predict_components(components, val_inputs, batch_size=cfg.batch_size, device=device)
+        val_input_df, val_true_df, val_pred_df, val_std_df = _prepare_split_frames(
+            val_inputs,
+            val_latent,
+            val_mean_latent,
+            val_var_latent,
+            data_module,
+        )
+        _save_report(
+            run_dir,
+            "val",
+            val_input_df,
+            val_true_df,
+            val_pred_df,
+            std_df=val_std_df if cfg.save_std else None,
+            error_feature_names=cfg.error_feature_names,
+        )
+
+    test_mean_latent, test_var_latent = _predict_components(components, test_inputs, batch_size=cfg.batch_size, device=device)
+    test_input_df, test_true_df, test_pred_df, test_std_df = _prepare_split_frames(
+        test_inputs,
+        test_latent,
+        test_mean_latent,
+        test_var_latent,
+        data_module,
+    )
+    _save_report(
+        run_dir,
+        "test",
+        test_input_df,
+        test_true_df,
+        test_pred_df,
+        std_df=test_std_df if cfg.save_std else None,
+        error_feature_names=cfg.error_feature_names,
+    )
+
+    # Individual test CSVs
+    individual = data_module.individual_test_dataframes()
+    if individual:
+        for idx, df in enumerate(individual, start=1):
+            inputs_std = data_module.scaler_x.transform(df[data_module.input_cols].to_numpy(dtype=np.float32, copy=True))
+            targets_latent = data_module.encode_targets(df[data_module.target_cols])
+            mean_latent, var_latent = _predict_components(components, inputs_std, batch_size=cfg.batch_size, device=device)
+            input_df, true_df, pred_df, std_df = _prepare_split_frames(
+                inputs_std,
+                targets_latent,
+                mean_latent,
+                var_latent,
+                data_module,
+            )
+            split_name = f"test_file_{idx}"
+            _save_report(
+                run_dir,
+                split_name,
+                input_df,
+                true_df,
+                pred_df,
+                std_df=std_df if cfg.save_std else None,
+                error_feature_names=cfg.error_feature_names,
+            )
+
+    print(f"Run artifacts saved to {run_dir}")
+
+
+if __name__ == "__main__":
+    main()

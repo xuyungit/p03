@@ -11,6 +11,7 @@ dependencies = [
     "matplotlib>=3.10.6",
     "numpy>=2.3.3",
     "pandas>=2.3.3",
+    "pytest>=8.4.2",
     "scikit-learn>=1.7.2",
     "scikit-optimize>=0.10.2",
     "seaborn>=0.13.2",

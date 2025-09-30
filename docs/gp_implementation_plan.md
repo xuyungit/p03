@@ -268,8 +268,8 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
   - [x] 接入/复用 `augment_config` 翻转增强
 
 - A 档：SVGP 基线
-  - [ ] 实现 `src/models/gp/svgp_baseline.py`（CLI 与 NN/Tree 对齐）
-  - [ ] 支持核选择（RBF/Matérn）、ARD、诱导点初始化（kmeans/random）
+  - [x] 实现 `src/models/gp/svgp_baseline.py`（CLI 与 NN/Tree 对齐）
+  - [x] 支持核选择（RBF/Matérn）、ARD、诱导点初始化（kmeans/random）
   - [ ] 小批量训练循环（预热→联合），学习率调度与早停
   - [ ] 产物保存：`config.json`、`checkpoints`、`scaler_x.pkl`、`scaler_y.pkl`、`pca.pkl`、预测 CSV/图表
   - [ ] 不确定性：保存 `std`、覆盖率、NLL、温度缩放 `τ`
@@ -277,7 +277,9 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
   - [ ] 冒烟：小规模数据完整跑通并生成产物
 
 - 测试
-  - [ ] 单元：列解析、PCA 逆映射、方差投影（`diag(W^T Var_Z W)`）
+  - [x] 单元：列解析（`resolve_from_csvs` 正则/空/异常）
+  - [ ] 单元：PCA 逆映射精度
+  - [x] 单元：方差投影（`diag(W^T Var_Z W)`）
   - [ ] 集成：`svgp_baseline.py` 全流程冒烟
   - [ ] 推理：`infer.py` 输入/输出列对齐检查
 
