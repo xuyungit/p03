@@ -306,9 +306,10 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
   - [x] 推理：默认输出 `quantile_tau.json` 对应分位区间（保留 `std`），CLI 需提供开关与输出格式（2025-09-30 完成于 `infer.py`，新增 `--save-quantiles/--save-raw-std/--quantile-mode`）。
 
 - B 档：ICM/LMC 多任务（第二阶段）
-  - [ ] 实现 `src/models/gp/mt_icm.py`（变分多任务）
-  - [ ] 任务协方差保存与可视化
-  - [ ] 对比实验与结论
+  - [x] 实现 `src/models/gp/mt_icm.py`（变分多任务）
+  - [x] 任务协方差保存与可视化
+  - [x] 对比实验与结论
+    - `experiments/mt_icm/2025-09-30_20-57-50`（seed 42，icm_rank=8，m=512，batch=512）：test MAE 20.6、RMSE 72.3、R²≈0.817、MAPE≈45.5%，0.9 覆盖率 0.897（raw）。相较 NN（5.57 MAE）与 A 档 SVGP（3.37 MAE）仍明显偏弱，后续需在变分噪声、latent 维度/秩及学习率策略上继续调参。
 
 - C 档：DKL（第三阶段）
   - [ ] 实现 `src/models/gp/dkl.py`（小型 MLP + SVGP）
@@ -323,7 +324,7 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
   - [x] T+0.5d 完成公共函数与 PCA 管道
   - [x] T+1.5d SVGP 基线训练/评估打通
   - [x] T+2d 不确定性指标与文档
-  - [ ] T+3d 推进 B/C 或调优 A
+  - [x] T+3d 推进 B/C 或调优 A（B 档原型已落地，性能待提）
 
 24. 其他畅想
 - 能否基于PCA的分析，减少模型的输入维度，比如根据PCA的分析，哪些维度是冗余的，哪些维度是重要的，哪些维度是相关的，哪些维度是无关的，从而减少模型的输入维度。

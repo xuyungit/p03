@@ -1,9 +1,4 @@
-"""SVGP baseline training script using :class:`GPDataModule` for data handling.
-
-This CLI mirrors existing tabular model entrypoints (e.g. bridge_nn.py,
-rev03_rtd_nf_e3_tree.py) so that experiment directories and evaluation
-artifacts remain comparable across model families.
-"""
+"""Multitask sparse variational GP with ICM kernel for PCA latent targets."""
 
 from __future__ import annotations
 
@@ -18,8 +13,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import gpytorch
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, TensorDataset
 from torch.optim import lr_scheduler
+from torch.utils.data import DataLoader, TensorDataset
 
 from models.gp.common import (
     GPDataConfig,
@@ -88,6 +83,7 @@ class CLIConfig:
     ard: bool = True
     inducing: int = 500
     inducing_init: str = "kmeans"
+    icm_rank: int = 2
     noise_init: float = 1e-3
     jitter: float = 1e-6
 
@@ -104,7 +100,6 @@ class CLIConfig:
     pca_max_components: Optional[int] = None
 
     experiment_root: Optional[Path] = None
-
     error_feature_names: Optional[List[str]] = None
 
 
@@ -133,7 +128,7 @@ def _maybe_path_list(value: object) -> List[Path]:
 
 
 def _parse_args() -> CLIConfig:
-    parser = argparse.ArgumentParser(description="SVGP baseline for bridge mechanics")
+    parser = argparse.ArgumentParser(description="Multitask SVGP with ICM kernel")
     parser.add_argument("--train-csv", type=Path, nargs="+", default=[Path("data/d03_all_train.csv")])
     parser.add_argument("--test-csv", type=Path, nargs="+", default=[Path("data/d03_all_test.csv")])
     parser.add_argument("--val-ratio", type=float, default=0.15)
@@ -167,6 +162,7 @@ def _parse_args() -> CLIConfig:
     parser.add_argument("--no-ard", action="store_true")
     parser.add_argument("--inducing", type=int, default=500)
     parser.add_argument("--inducing-init", type=str, choices=["kmeans", "random"], default="kmeans")
+    parser.add_argument("--icm-rank", type=int, default=2)
     parser.add_argument("--noise-init", type=float, default=1e-3)
     parser.add_argument("--jitter", type=float, default=1e-6)
 
@@ -217,25 +213,19 @@ def _parse_args() -> CLIConfig:
     elif args.save_std:
         save_std = True
 
-    coverage_levels = _split_float_tokens(args.coverage_list)
+    coverage_levels = _split_float_tokens(args.coverage_list) or [0.5, 0.9, 0.95]
+    coverage_levels = [level for level in coverage_levels if 0.0 < level < 1.0]
     if not coverage_levels:
-        coverage_levels = [0.5, 0.9, 0.95]
-    for level in coverage_levels:
-        if not 0.0 < level < 1.0:
-            raise SystemExit(f"Coverage levels must be in (0, 1); received {level}")
+        raise SystemExit("coverage list must contain at least one level in (0, 1)")
 
-    per_group_tau_mode = str(args.per_group_tau_mode or "auto").lower()
+    per_group_tau_mode = args.per_group_tau_mode
     per_group_tau_config = args.per_group_tau_config
-    if per_group_tau_mode not in {"none", "auto", "config"}:
-        raise SystemExit(
-            f"Unsupported --per-group-tau-mode '{args.per_group_tau_mode}'; use none/auto/config"
-        )
     if per_group_tau_mode == "config" and per_group_tau_config is None:
-        raise SystemExit("--per-group-tau-config is required when --per-group-tau-mode=config")
+        raise SystemExit("per-group tau mode 'config' requires --per-group-tau-config")
 
     cfg = CLIConfig(
-        train_csv=list(args.train_csv),
-        test_csv=list(args.test_csv),
+        train_csv=args.train_csv,
+        test_csv=args.test_csv,
         val_ratio=args.val_ratio,
         augment_flip=augment_flip,
         augment_profile=args.augment_profile,
@@ -262,6 +252,7 @@ def _parse_args() -> CLIConfig:
         ard=ard,
         inducing=args.inducing,
         inducing_init=args.inducing_init,
+        icm_rank=max(1, args.icm_rank),
         noise_init=args.noise_init,
         jitter=args.jitter,
         save_std=save_std,
@@ -280,6 +271,10 @@ def _parse_args() -> CLIConfig:
     if cfg.preset is not None:
         cfg = _apply_preset(cfg)
     return cfg
+
+
+def dataclass_replace(cfg: CLIConfig) -> CLIConfig:
+    return CLIConfig(**asdict(cfg))
 
 
 def _apply_preset(cfg: CLIConfig) -> CLIConfig:
@@ -326,6 +321,7 @@ def _apply_preset(cfg: CLIConfig) -> CLIConfig:
         "ard",
         "inducing",
         "inducing_init",
+        "icm_rank",
         "noise_init",
         "jitter",
         "pca_enable",
@@ -358,18 +354,11 @@ def _apply_preset(cfg: CLIConfig) -> CLIConfig:
         else:
             try:
                 levels = [float(x) for x in raw_levels]
-            except TypeError as exc:  # pragma: no cover - defensive path
+            except Exception as exc:  # pragma: no cover - invalid preset
                 raise SystemExit(f"Invalid coverage_levels in preset: {raw_levels}") from exc
         if not levels:
             raise SystemExit("coverage_levels in preset must not be empty")
-        for lvl in levels:
-            if not 0.0 < lvl < 1.0:
-                raise SystemExit(f"Preset coverage level {lvl} must be in (0, 1)")
-        updated.coverage_levels = levels
-    if "experiment_root" in payload and cfg.experiment_root is None:
-        updated.experiment_root = Path(payload["experiment_root"])
-    if updated.error_feature_names is None and payload.get("error_feature_names"):
-        updated.error_feature_names = [str(x) for x in payload["error_feature_names"]]
+        updated.coverage_levels = [lvl for lvl in levels if 0.0 < lvl < 1.0]
     if "per_group_tau_mode" in payload:
         updated.per_group_tau_mode = str(payload["per_group_tau_mode"]).lower()
     if (
@@ -378,16 +367,16 @@ def _apply_preset(cfg: CLIConfig) -> CLIConfig:
         and payload["per_group_tau_config"] is not None
     ):
         updated.per_group_tau_config = Path(payload["per_group_tau_config"])
+    if "experiment_root" in payload and cfg.experiment_root is None:
+        updated.experiment_root = Path(payload["experiment_root"])
+    if updated.error_feature_names is None and payload.get("error_feature_names"):
+        updated.error_feature_names = [str(x) for x in payload["error_feature_names"]]
 
     return updated
 
 
-def dataclass_replace(cfg: CLIConfig) -> CLIConfig:
-    return CLIConfig(**asdict(cfg))
-
-
 # ---------------------------------------------------------------------------
-# Training utilities
+# Model definition and training helpers
 # ---------------------------------------------------------------------------
 
 
@@ -396,35 +385,6 @@ def _set_all_seeds(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-def _set_prewarm_mode(
-    model: SingleTaskSVGP,
-    likelihood: gpytorch.likelihoods.GaussianLikelihood,
-    *,
-    enable: bool,
-) -> None:
-    """Freeze/unfreeze parameters for the pre-warm stage.
-
-    When ``enable`` is True we only allow the kernel lengthscales and noise term
-    to update; all other parameters are temporarily frozen.
-    """
-
-    for param in model.variational_parameters():
-        param.requires_grad = not enable
-
-    inducing_points = getattr(model.variational_strategy, "inducing_points", None)
-    if isinstance(inducing_points, torch.nn.Parameter):
-        inducing_points.requires_grad = not enable
-
-    base_kernel = getattr(model.covar_module, "base_kernel", None)
-    if base_kernel is not None and hasattr(base_kernel, "raw_lengthscale"):
-        base_kernel.raw_lengthscale.requires_grad = True
-
-    if hasattr(model.covar_module, "raw_outputscale"):
-        model.covar_module.raw_outputscale.requires_grad = not enable
-
-    if hasattr(likelihood, "raw_noise"):
-        likelihood.raw_noise.requires_grad = True
 
 
 def _build_scheduler(cfg: CLIConfig, optimizer: torch.optim.Optimizer) -> Optional[lr_scheduler._LRScheduler]:
@@ -439,38 +399,51 @@ def _build_scheduler(cfg: CLIConfig, optimizer: torch.optim.Optimizer) -> Option
     raise ValueError(f"Unsupported lr_decay mode '{cfg.lr_decay}'")
 
 
-class SingleTaskSVGP(gpytorch.models.ApproximateGP):
-    """SVGP model for a single latent dimension."""
+class MultitaskICMSVGP(gpytorch.models.ApproximateGP):
+    """Shared-inducing multi-output SVGP with an ICM kernel."""
 
     def __init__(
         self,
         inducing_points: torch.Tensor,
+        num_tasks: int,
         *,
         kernel: str,
         ard: bool,
+        icm_rank: int,
         jitter: float,
     ) -> None:
+        num_tasks = int(num_tasks)
+        num_latents = max(1, int(icm_rank))
         variational_distribution = gpytorch.variational.CholeskyVariationalDistribution(
-            inducing_points.size(-2)
+            inducing_points.size(-2),
+            batch_shape=torch.Size([num_latents]),
         )
-        variational_strategy = gpytorch.variational.VariationalStrategy(
+        base_strategy = gpytorch.variational.VariationalStrategy(
             self,
             inducing_points,
             variational_distribution,
             learn_inducing_locations=True,
         )
+        variational_strategy = gpytorch.variational.LMCVariationalStrategy(
+            base_strategy,
+            num_tasks=num_tasks,
+            num_latents=num_latents,
+        )
         super().__init__(variational_strategy)
 
+        batch_shape = torch.Size([num_latents])
         ard_dims = inducing_points.size(-1) if ard else None
         if kernel == "rbf":
-            base_kernel = gpytorch.kernels.RBFKernel(ard_num_dims=ard_dims)
+            base_kernel = gpytorch.kernels.RBFKernel(batch_shape=batch_shape, ard_num_dims=ard_dims)
         elif kernel == "matern52":
-            base_kernel = gpytorch.kernels.MaternKernel(nu=2.5, ard_num_dims=ard_dims)
+            base_kernel = gpytorch.kernels.MaternKernel(batch_shape=batch_shape, nu=2.5, ard_num_dims=ard_dims)
         else:  # pragma: no cover - guarded by argparse
             raise ValueError(f"Unsupported kernel '{kernel}'")
-        self.mean_module = gpytorch.means.ZeroMean()
-        self.covar_module = gpytorch.kernels.ScaleKernel(base_kernel)
+        self.mean_module = gpytorch.means.ZeroMean(batch_shape=batch_shape)
+        self.covar_module = gpytorch.kernels.ScaleKernel(base_kernel, batch_shape=batch_shape)
         self._manual_jitter = float(jitter)
+        self.num_tasks = num_tasks
+        self.num_latents = num_latents
 
     def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
         mean_x = self.mean_module(x)
@@ -481,10 +454,36 @@ class SingleTaskSVGP(gpytorch.models.ApproximateGP):
         return self._manual_jitter
 
 
-@dataclass
-class ComponentState:
-    model: SingleTaskSVGP
-    likelihood: gpytorch.likelihoods.GaussianLikelihood
+def _set_prewarm_mode(
+    model: MultitaskICMSVGP,
+    likelihood: gpytorch.likelihoods.MultitaskGaussianLikelihood,
+    *,
+    enable: bool,
+) -> None:
+    if enable:
+        for param in model.parameters():
+            param.requires_grad = False
+        for param in likelihood.parameters():
+            param.requires_grad = False
+        base_vs = getattr(model.variational_strategy, "base_variational_strategy", None)
+        if base_vs is None:
+            base_vs = getattr(model.variational_strategy, "_variational_strategy", None)
+        if base_vs is not None:
+            inducing = getattr(base_vs, "inducing_points", None)
+            if isinstance(inducing, torch.nn.Parameter):
+                inducing.requires_grad = False
+        if hasattr(model.variational_strategy, "lmc_coefficients"):
+            model.variational_strategy.lmc_coefficients.requires_grad = False
+        base_kernel = getattr(model.covar_module, "base_kernel", model.covar_module)
+        if hasattr(base_kernel, "raw_lengthscale"):
+            base_kernel.raw_lengthscale.requires_grad = True
+        if hasattr(likelihood, "raw_noise"):
+            likelihood.raw_noise.requires_grad = True
+    else:
+        for param in model.parameters():
+            param.requires_grad = True
+        for param in likelihood.parameters():
+            param.requires_grad = True
 
 
 def _make_loader(
@@ -501,8 +500,7 @@ def _make_loader(
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, drop_last=False)
 
 
-def _train_component(
-    component_idx: int,
+def _train_model(
     cfg: CLIConfig,
     device: torch.device,
     inducing_points: torch.Tensor,
@@ -510,9 +508,17 @@ def _train_component(
     train_targets: np.ndarray,
     val_inputs: Optional[np.ndarray],
     val_targets: Optional[np.ndarray],
-) -> Tuple[ComponentState, List[Dict[str, float]]]:
-    model = SingleTaskSVGP(inducing_points.clone(), kernel=cfg.kernel, ard=cfg.ard, jitter=cfg.jitter)
-    likelihood = gpytorch.likelihoods.GaussianLikelihood()
+) -> Tuple[MultitaskICMSVGP, gpytorch.likelihoods.MultitaskGaussianLikelihood, List[Dict[str, float]]]:
+    num_tasks = train_targets.shape[1]
+    model = MultitaskICMSVGP(
+        inducing_points.clone(),
+        num_tasks,
+        kernel=cfg.kernel,
+        ard=cfg.ard,
+        icm_rank=cfg.icm_rank,
+        jitter=cfg.jitter,
+    )
+    likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=num_tasks)
     likelihood.initialize(noise=cfg.noise_init)
 
     model.to(device)
@@ -524,13 +530,10 @@ def _train_component(
         val_loader = _make_loader(val_inputs, val_targets, batch_size=cfg.batch_size, shuffle=False)
 
     num_data = train_loader.dataset.tensors[0].shape[0]
-    optimizer = torch.optim.Adam(
-        [
-            {"params": model.parameters()},
-            {"params": likelihood.parameters()},
-        ],
-        lr=cfg.lr,
-    )
+    optimizer = torch.optim.Adam([
+        {"params": model.parameters()},
+        {"params": likelihood.parameters()},
+    ], lr=cfg.lr)
     mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=num_data)
     scheduler = _build_scheduler(cfg, optimizer)
 
@@ -558,7 +561,7 @@ def _train_component(
         batch_count = 0
         for xb, yb in train_loader:
             xb = xb.to(device)
-            yb = yb.squeeze(-1).to(device)
+            yb = yb.to(device)
 
             optimizer.zero_grad(set_to_none=True)
             with gpytorch.settings.cholesky_jitter(model.extra_jitter()):
@@ -601,7 +604,7 @@ def _train_component(
 
         history.append(
             {
-                "component": float(component_idx),
+                "component": -1.0,
                 "epoch": float(epoch),
                 "train_elbo": avg_loss,
                 "val_rmse": float(val_rmse) if val_rmse is not None else float("nan"),
@@ -611,18 +614,14 @@ def _train_component(
         )
 
         if cfg.print_freq and epoch % cfg.print_freq == 0:
-            msg = (
-                f"Component {component_idx:02d} | epoch {epoch:04d}"
-                f" | lr {current_lr:.5f} | train loss {avg_loss:.4f}"
-            )
+            msg = f"Epoch {epoch:04d} | lr {current_lr:.5f} | train loss {avg_loss:.4f}"
             if val_rmse is not None:
                 msg += f" | val RMSE {val_rmse:.4f}"
             print(msg)
 
         if use_early_stopping and epoch > prewarm_epochs and epochs_no_improve >= cfg.patience:
             print(
-                f"Early stopping component {component_idx:02d} after {epoch} epochs; "
-                f"best val RMSE {best_val:.4f} at epoch {best_epoch}"
+                f"Early stopping after {epoch} epochs; best val RMSE {best_val:.4f} at epoch {best_epoch}"
             )
             break
 
@@ -633,12 +632,12 @@ def _train_component(
     model.cpu()
     likelihood.cpu()
     torch.cuda.empty_cache()
-    return ComponentState(model=model, likelihood=likelihood), history
+    return model, likelihood, history
 
 
 def _estimate_rmse(
-    model: SingleTaskSVGP,
-    likelihood: gpytorch.likelihoods.GaussianLikelihood,
+    model: MultitaskICMSVGP,
+    likelihood: gpytorch.likelihoods.MultitaskGaussianLikelihood,
     loader: DataLoader,
     device: torch.device,
 ) -> float:
@@ -649,52 +648,92 @@ def _estimate_rmse(
     with torch.no_grad():
         for xb, yb in loader:
             xb = xb.to(device)
-            yb = yb.squeeze(-1).to(device)
-            with gpytorch.settings.fast_pred_var():
+            yb = yb.to(device)
+            with gpytorch.settings.fast_pred_var(), gpytorch.settings.cholesky_jitter(model.extra_jitter()):
                 posterior = likelihood(model(xb))
             preds.append(posterior.mean.cpu())
             targets.append(yb.cpu())
-    pred_vec = torch.cat(preds)
-    target_vec = torch.cat(targets)
-    mse = torch.mean((pred_vec - target_vec) ** 2)
+    pred_mat = torch.cat(preds)
+    target_mat = torch.cat(targets)
+    mse = torch.mean((pred_mat - target_mat) ** 2)
     return float(torch.sqrt(mse))
 
 
-def _predict_components(
-    components: Sequence[ComponentState],
+def _predict_mean_var(
+    model: MultitaskICMSVGP,
+    likelihood: gpytorch.likelihoods.MultitaskGaussianLikelihood,
     inputs: np.ndarray,
     *,
     batch_size: int,
     device: torch.device,
 ) -> Tuple[np.ndarray, np.ndarray]:
+    model = model.to(device)
+    likelihood = likelihood.to(device)
+    model.eval()
+    likelihood.eval()
+
     num_samples = inputs.shape[0]
-    latent_dim = len(components)
-    mean_out = np.zeros((num_samples, latent_dim), dtype=np.float64)
-    var_out = np.zeros((num_samples, latent_dim), dtype=np.float64)
+    num_tasks = model.num_tasks
+    mean_out = np.zeros((num_samples, num_tasks), dtype=np.float64)
+    var_out = np.zeros((num_samples, num_tasks), dtype=np.float64)
 
-    loader = _make_loader(inputs, np.zeros((num_samples, 1), dtype=np.float32), batch_size=batch_size, shuffle=False)
+    with torch.no_grad():
+        for start in range(0, num_samples, batch_size):
+            end = min(start + batch_size, num_samples)
+            xb = torch.from_numpy(inputs[start:end].astype(np.float32, copy=False)).to(device)
+            with gpytorch.settings.fast_pred_var(), gpytorch.settings.cholesky_jitter(model.extra_jitter()):
+                posterior = likelihood(model(xb))
+            mean_out[start:end] = posterior.mean.detach().cpu().numpy()
+            var_out[start:end] = posterior.variance.detach().cpu().numpy()
 
-    for comp_idx, comp in enumerate(components):
-        model = comp.model.to(device)
-        likelihood = comp.likelihood.to(device)
-        model.eval()
-        likelihood.eval()
-
-        preds: List[torch.Tensor] = []
-        vars_: List[torch.Tensor] = []
-        with torch.no_grad():
-            for xb, _ in loader:
-                xb = xb.to(device)
-                with gpytorch.settings.fast_pred_var(), gpytorch.settings.cholesky_jitter(model.extra_jitter()):
-                    posterior = likelihood(model(xb))
-                preds.append(posterior.mean.detach().cpu())
-                vars_.append(posterior.variance.detach().cpu())
-        mean_out[:, comp_idx] = torch.cat(preds).numpy()
-        var_out[:, comp_idx] = torch.cat(vars_).numpy()
-        model.cpu()
-        likelihood.cpu()
+    model.cpu()
+    likelihood.cpu()
     torch.cuda.empty_cache()
-    return mean_out.astype(np.float64), var_out.astype(np.float64)
+    return mean_out, var_out
+
+
+def _save_task_covariance(
+    model: MultitaskICMSVGP,
+    run_dir: Path,
+    *,
+    component_labels: Sequence[str],
+) -> None:
+    if len(component_labels) != model.num_tasks:
+        component_labels = [f"{idx}" for idx in range(model.num_tasks)]
+    coeff = model.variational_strategy.lmc_coefficients.detach().cpu().numpy()
+    coeff = np.reshape(coeff, (model.num_latents, model.num_tasks))
+    outputscale = model.covar_module.outputscale.detach().cpu().numpy()
+    outputscale = np.asarray(outputscale, dtype=np.float64)
+    if outputscale.ndim == 0:
+        outputscale = np.repeat(outputscale, model.num_latents)
+    outputscale = outputscale.reshape(model.num_latents)
+    weights = coeff * np.sqrt(np.maximum(outputscale, 0.0))[:, None]
+    cov = weights.T @ weights
+    np.savetxt(run_dir / "task_covariance.csv", cov, delimiter=",")
+
+    try:
+        import matplotlib.pyplot as plt
+    except Exception:  # pragma: no cover - matplotlib may be unavailable
+        return
+
+    fig, ax = plt.subplots(figsize=(max(6, len(component_labels) * 0.4), 5))
+    im = ax.imshow(cov, cmap="viridis")
+    ax.set_title("ICM Task Covariance (latent space)")
+    ax.set_xlabel("Component")
+    ax.set_ylabel("Component")
+    ax.set_xticks(range(len(component_labels)))
+    ax.set_yticks(range(len(component_labels)))
+    ax.set_xticklabels(component_labels, rotation=45, ha="right")
+    ax.set_yticklabels(component_labels)
+    fig.colorbar(im, ax=ax, shrink=0.8)
+    fig.tight_layout()
+    plt.savefig(run_dir / "plots" / "task_covariance_heatmap.png", dpi=200)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Main execution flow
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -756,6 +795,7 @@ def main() -> None:
         cfg_payload["per_group_tau_config"] = str(cfg.per_group_tau_config)
     cfg_payload["resolved_input_cols"] = list(data_module.input_cols)
     cfg_payload["resolved_target_cols"] = list(data_module.target_cols)
+    cfg_payload["latent_dim"] = data_module.target_latent_dim
     if group_mapping is not None:
         cfg_payload["target_group_map"] = group_mapping.to_serializable()
     save_run_config(run_dir, cfg_payload)
@@ -771,37 +811,39 @@ def main() -> None:
     test_inputs, test_latent = data_module.test_arrays()
 
     inducing_points = init_inducing_points(train_inputs, cfg.inducing, cfg.inducing_init, seed=cfg.seed)
-    components: List[ComponentState] = []
-    history_rows: List[Dict[str, float]] = []
-    latent_dim = train_latent.shape[1]
+    model, likelihood, history_rows = _train_model(
+        cfg,
+        device,
+        inducing_points,
+        train_inputs,
+        train_latent,
+        val_inputs if val_inputs is not None else None,
+        val_latent if val_latent is not None else None,
+    )
 
-    for idx in range(latent_dim):
-        state, history = _train_component(
-            idx,
-            cfg,
-            device,
-            inducing_points,
-            train_inputs,
-            train_latent[:, idx : idx + 1],
-            val_inputs if val_inputs is not None else None,
-            val_latent[:, idx : idx + 1] if val_latent is not None else None,
-        )
-        components.append(state)
-        history_rows.extend(history)
-        torch.save(
-            {
-                "model_state": state.model.state_dict(),
-                "likelihood_state": state.likelihood.state_dict(),
-                "kernel": cfg.kernel,
-                "ard": cfg.ard,
-            },
-            run_dir / "checkpoints" / f"component_{idx:02d}.pt",
-        )
-
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "likelihood_state": likelihood.state_dict(),
+            "kernel": cfg.kernel,
+            "ard": cfg.ard,
+            "icm_rank": cfg.icm_rank,
+        },
+        run_dir / "checkpoints" / "model.pt",
+    )
     write_history(run_dir, history_rows)
 
+    latent_labels = [f"z_{idx:02d}" for idx in range(data_module.target_latent_dim)]
+    _save_task_covariance(model, run_dir, component_labels=latent_labels)
+
     # Evaluate train / val / test splits
-    train_mean_latent, train_var_latent = _predict_components(components, train_inputs, batch_size=cfg.batch_size, device=device)
+    train_mean_latent, train_var_latent = _predict_mean_var(
+        model,
+        likelihood,
+        train_inputs,
+        batch_size=cfg.batch_size,
+        device=device,
+    )
     train_input_df, train_true_df, train_pred_df, train_std_df = prepare_split_frames(
         train_inputs,
         train_latent,
@@ -817,7 +859,7 @@ def main() -> None:
         train_pred_df,
         std_df=train_std_df if cfg.save_std else None,
         error_feature_names=cfg.error_feature_names,
-        model_name="svgp",
+        model_name="mticm",
     )
     write_uncertainty_metrics(
         run_dir,
@@ -835,7 +877,13 @@ def main() -> None:
     per_group_tau: Dict[str, float] = {}
     quantile_tau: Dict[float, float] = {}
     if val_inputs is not None and val_latent is not None:
-        val_mean_latent, val_var_latent = _predict_components(components, val_inputs, batch_size=cfg.batch_size, device=device)
+        val_mean_latent, val_var_latent = _predict_mean_var(
+            model,
+            likelihood,
+            val_inputs,
+            batch_size=cfg.batch_size,
+            device=device,
+        )
         val_input_df, val_true_df, val_pred_df, val_std_df = prepare_split_frames(
             val_inputs,
             val_latent,
@@ -851,9 +899,14 @@ def main() -> None:
             val_pred_df,
             std_df=val_std_df if cfg.save_std else None,
             error_feature_names=cfg.error_feature_names,
-            model_name="svgp",
+            model_name="mticm",
         )
-        tau_value = calibrate_global_tau(val_true_df, val_pred_df, val_std_df, cfg.coverage_levels)
+        tau_value = calibrate_global_tau(
+            val_true_df,
+            val_pred_df,
+            val_std_df,
+            cfg.coverage_levels,
+        )
         if group_indices and cfg.per_group_tau_mode != "none":
             per_group_tau = calibrate_groupwise_tau(
                 val_true_df,
@@ -915,7 +968,13 @@ def main() -> None:
                     indent=2,
                 )
 
-    test_mean_latent, test_var_latent = _predict_components(components, test_inputs, batch_size=cfg.batch_size, device=device)
+    test_mean_latent, test_var_latent = _predict_mean_var(
+        model,
+        likelihood,
+        test_inputs,
+        batch_size=cfg.batch_size,
+        device=device,
+    )
     test_input_df, test_true_df, test_pred_df, test_std_df = prepare_split_frames(
         test_inputs,
         test_latent,
@@ -931,7 +990,7 @@ def main() -> None:
         test_pred_df,
         std_df=test_std_df if cfg.save_std else None,
         error_feature_names=cfg.error_feature_names,
-        model_name="svgp",
+        model_name="mticm",
     )
     write_uncertainty_metrics(
         run_dir,
@@ -948,13 +1007,20 @@ def main() -> None:
         ),
     )
 
-    # Individual test CSVs
     individual = data_module.individual_test_dataframes()
     if individual:
         for idx, df in enumerate(individual, start=1):
-            inputs_std = data_module.scaler_x.transform(df[data_module.input_cols].to_numpy(dtype=np.float32, copy=True))
+            inputs_std = data_module.scaler_x.transform(
+                df[data_module.input_cols].to_numpy(dtype=np.float32, copy=True)
+            )
             targets_latent = data_module.encode_targets(df[data_module.target_cols])
-            mean_latent, var_latent = _predict_components(components, inputs_std, batch_size=cfg.batch_size, device=device)
+            mean_latent, var_latent = _predict_mean_var(
+                model,
+                likelihood,
+                inputs_std,
+                batch_size=cfg.batch_size,
+                device=device,
+            )
             input_df, true_df, pred_df, std_df = prepare_split_frames(
                 inputs_std,
                 targets_latent,
@@ -971,7 +1037,7 @@ def main() -> None:
                 pred_df,
                 std_df=std_df if cfg.save_std else None,
                 error_feature_names=cfg.error_feature_names,
-                model_name="svgp",
+                model_name="mticm",
             )
             write_uncertainty_metrics(
                 run_dir,
