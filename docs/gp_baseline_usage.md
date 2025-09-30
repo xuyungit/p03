@@ -48,9 +48,11 @@ Replace `--seed` as required (seeds 7 and 1337 added for significance checks).
 
 ## Uncertainty Calibration
 
-Global tau on seed 42 (`tau = 0.408`) tightens intervals but remains conservative for 0.9 coverage (0.856). A per-target-family scaling that matches 0.9 coverage on the validation split improves test coverage without hurting NLL:
+`svgp_baseline.py` now calibrates both a global tau and per-target-family tau values on the validation split. By default (`--per-group-tau-mode auto`) the families are inferred from leading alphabetic prefixes (e.g. `R`, `Ry`, `Rx`, `D`) and stored in `per_group_tau.json` alongside `tau.json`. The inference utility (`src/models/gp/infer.py`) loads these files automatically when `--tau-mode auto` (default) so downstream scoring always uses the best available calibration. Use `--per-group-tau-mode none` to skip group calibration or `--per-group-tau-mode config --per-group-tau-config path.json` to supply custom groups. Inference can be forced to a particular strategy via `--tau-mode {per-group,global,none}`.
 
-- Per-group tau values (val 0.9 target): `R=0.496`, `Ry=0.476`, `Rx=0.460`, `D=0.445`.
+Seed 42 numbers (auto mode) remain unchanged numerically but are now emitted directly by the CLI:
+
+- Per-group tau validation fit (targeting 0.9 coverage): `R=0.496`, `Ry=0.476`, `Rx=0.460`, `D=0.445`.
 - Test NLL improves from -2.636 (global tau) to -2.684 (per-group), while 0.9 coverage rises from 0.856 to 0.887.
 
 | Family | Raw 0.9 cov | Global tau 0.9 cov | Per-group 0.9 cov |
@@ -60,4 +62,4 @@ Global tau on seed 42 (`tau = 0.408`) tightens intervals but remains conservativ
 | Rx | 0.991 | 0.860 | 0.888 |
 | D | 0.990 | 0.864 | 0.885 |
 
-Artifact snapshot stored at `experiments/svgp_baseline/2025-09-30_13-44-49/per_group_tau.json`.
+Calibration artifacts live under each run directory (e.g. `experiments/svgp_baseline/2025-09-30_13-44-49/per_group_tau.json`).

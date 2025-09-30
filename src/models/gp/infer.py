@@ -10,8 +10,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import gpytorch
 import numpy as np
@@ -20,6 +21,7 @@ import torch
 from joblib import load
 
 from models.gp.common import PCAPipeline
+from models.gp.uncertainty import scale_standard_deviation
 from models.gp.svgp_baseline import ComponentState, SingleTaskSVGP, _predict_components
 
 
@@ -34,6 +36,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--no-save-std", dest="save_std", action="store_false", help="Skip writing std CSVs")
     parser.add_argument("--tau", type=float, default=None, help="Override tau scaling factor (multiplies std); defaults to tau.json when available")
     parser.add_argument("--no-tau", action="store_true", help="Disable tau scaling even if tau.json is present")
+    parser.add_argument(
+        "--tau-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "global", "per-group", "none"],
+        help="Select which stored tau scaling to apply when tau is not provided",
+    )
     parser.set_defaults(save_std=True)
     return parser.parse_args()
 
@@ -65,6 +74,55 @@ def _load_preprocessors(run_dir: Path) -> Tuple[object, object, Optional[PCAPipe
 
 _COMPONENT_PATTERN = re.compile(r"component_(\d+)\.pt$")
 
+
+def _group_indices_from_map(
+    target_cols: Sequence[str],
+    group_map: Optional[Dict[str, Sequence[str]]],
+) -> Dict[str, List[int]]:
+    if not group_map:
+        return {}
+    index_lookup = {col: idx for idx, col in enumerate(target_cols)}
+    resolved: Dict[str, List[int]] = {}
+    for group, columns in group_map.items():
+        indices = []
+        for col in columns:
+            idx = index_lookup.get(col)
+            if idx is not None:
+                indices.append(idx)
+        if indices:
+            resolved[group] = indices
+    return resolved
+
+
+@dataclass
+class TauSelection:
+    global_tau: Optional[float] = None
+    per_group_tau: Dict[str, float] = field(default_factory=dict)
+    group_indices: Optional[Dict[str, List[int]]] = None
+    source: str = "none"
+
+    def is_identity(self) -> bool:
+        return self.global_tau is None and not self.per_group_tau
+
+    def apply(self, std: np.ndarray) -> np.ndarray:
+        if self.is_identity():
+            return std
+        return scale_standard_deviation(
+            std,
+            global_tau=self.global_tau,
+            per_group_tau=self.per_group_tau,
+            group_indices=self.group_indices,
+        )
+
+    def summary(self) -> str:
+        if self.per_group_tau:
+            items = [f"{key}={value:.3f}" for key, value in sorted(self.per_group_tau.items())]
+            if len(items) <= 4:
+                return "per-group (" + ", ".join(items) + ")"
+            return f"per-group ({len(items)} groups)"
+        if self.global_tau is not None:
+            return f"tau={self.global_tau:.4f}"
+        return "none"
 
 def _load_components(
     run_dir: Path,
@@ -109,23 +167,98 @@ def _load_components(
     return components
 
 
-def _resolve_tau(run_dir: Path, *, tau_arg: Optional[float], disable_tau: bool) -> Optional[float]:
+def _resolve_tau_selection(
+    run_dir: Path,
+    config: Dict[str, object],
+    target_cols: Sequence[str],
+    *,
+    tau_arg: Optional[float],
+    disable_tau: bool,
+    mode: str,
+) -> TauSelection:
+    config_group_map = config.get("target_group_map") if isinstance(config, dict) else None
+    config_group_indices = _group_indices_from_map(
+        target_cols, config_group_map if isinstance(config_group_map, dict) else None
+    )
+
     if tau_arg is not None:
-        return float(tau_arg)
-    if disable_tau:
-        return None
+        return TauSelection(
+            global_tau=float(tau_arg),
+            group_indices=config_group_indices or None,
+            source="cli",
+        )
+
+    mode_normalized = (mode or "auto").lower()
+    if disable_tau or mode_normalized == "none":
+        return TauSelection(group_indices=config_group_indices or None, source="none")
+
+    per_group_selection: Optional[TauSelection] = None
+    if mode_normalized in {"per-group", "auto"}:
+        per_group_path = run_dir / "per_group_tau.json"
+        if per_group_path.exists():
+            try:
+                with per_group_path.open("r") as handle:
+                    payload = json.load(handle)
+            except Exception as exc:  # pragma: no cover - defensive path
+                print(f"Warning: failed to load {per_group_path}: {exc}")
+            else:
+                raw_values = payload.get("values", {})
+                per_group_values: Dict[str, float] = {}
+                if isinstance(raw_values, dict):
+                    for key, value in raw_values.items():
+                        try:
+                            per_group_values[str(key)] = float(value)
+                        except (TypeError, ValueError):
+                            continue
+                groups_map = payload.get("groups")
+                group_indices = _group_indices_from_map(
+                    target_cols, groups_map if isinstance(groups_map, dict) else None
+                )
+                if not group_indices and config_group_indices:
+                    group_indices = config_group_indices
+                if per_group_values and group_indices:
+                    per_group_selection = TauSelection(
+                        global_tau=None,
+                        per_group_tau=per_group_values,
+                        group_indices=group_indices,
+                        source=str(payload.get("source", "per_group")),
+                    )
+        elif mode_normalized == "per-group":
+            print(
+                "Warning: per-group tau requested but per_group_tau.json was not found; proceeding without scaling."
+            )
+
+    if mode_normalized == "per-group":
+        return per_group_selection or TauSelection(
+            group_indices=config_group_indices or None, source="none"
+        )
+
+    if per_group_selection is not None and mode_normalized == "auto":
+        return per_group_selection
+
     tau_path = run_dir / "tau.json"
-    if not tau_path.exists():
-        return None
-    with tau_path.open("r") as handle:
-        payload = json.load(handle)
-    value = payload.get("value")
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"Invalid tau value stored in {tau_path}: {value}") from exc
+    if tau_path.exists():
+        try:
+            with tau_path.open("r") as handle:
+                payload = json.load(handle)
+        except Exception as exc:  # pragma: no cover - defensive path
+            print(f"Warning: failed to load {tau_path}: {exc}")
+        else:
+            value = payload.get("value")
+            if value is not None:
+                try:
+                    return TauSelection(
+                        global_tau=float(value),
+                        group_indices=config_group_indices or None,
+                        source=str(payload.get("source", "global")),
+                    )
+                except (TypeError, ValueError):
+                    print(f"Warning: invalid tau value stored in {tau_path}: {value}")
+
+    if per_group_selection is not None:
+        return per_group_selection
+
+    return TauSelection(group_indices=config_group_indices or None, source="none")
 
 
 def _prepare_inputs(df: pd.DataFrame, input_cols: Sequence[str]) -> np.ndarray:
@@ -142,7 +275,7 @@ def _decode_predictions(
     *,
     scaler_y,
     pca: Optional[PCAPipeline],
-    tau: Optional[float],
+    tau_selection: Optional[TauSelection],
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     if pca is not None:
         mean_std = pca.inverse_transform(mean_latent)
@@ -162,8 +295,8 @@ def _decode_predictions(
 
     var_orig = np.maximum(var_orig, 0.0)
     std_orig = np.sqrt(var_orig)
-    if tau is not None:
-        std_orig = std_orig * float(tau)
+    if tau_selection is not None and not tau_selection.is_identity():
+        std_orig = tau_selection.apply(std_orig)
     return mean_orig, std_orig
 
 
@@ -209,7 +342,14 @@ def main() -> None:
 
     scaler_x, scaler_y, pca_pipe = _load_preprocessors(run_dir)
     components = _load_components(run_dir, kernel=kernel, ard=ard, jitter=jitter)
-    tau_value = _resolve_tau(run_dir, tau_arg=args.tau, disable_tau=args.no_tau)
+    tau_selection = _resolve_tau_selection(
+        run_dir,
+        config,
+        target_cols,
+        tau_arg=args.tau,
+        disable_tau=args.no_tau,
+        mode=args.tau_mode,
+    )
 
     output_dir = args.output_dir or (run_dir / "infer")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -220,7 +360,13 @@ def main() -> None:
         inputs_std = scaler_x.transform(raw_inputs).astype(np.float32, copy=False)
 
         mean_latent, var_latent = _predict_components(components, inputs_std, batch_size=batch_size, device=device)
-        mean_orig, std_orig = _decode_predictions(mean_latent, var_latent, scaler_y=scaler_y, pca=pca_pipe, tau=tau_value)
+        mean_orig, std_orig = _decode_predictions(
+            mean_latent,
+            var_latent,
+            scaler_y=scaler_y,
+            pca=pca_pipe,
+            tau_selection=tau_selection,
+        )
 
         stem = csv_path.stem
         mean_path, std_path = _write_outputs(
@@ -235,8 +381,8 @@ def main() -> None:
         message = f"Wrote predictions to {mean_path}"
         if args.save_std and std_path is not None:
             message += f"; std to {std_path}"
-        if tau_value is not None:
-            message += f" (tau={tau_value:.4f})"
+        if not tau_selection.is_identity():
+            message += f" (tau={tau_selection.summary()})"
         print(message)
 
 

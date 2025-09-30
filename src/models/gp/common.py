@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -438,3 +440,174 @@ def make_evaluation_report(
     report = EvaluationReport(model_name)
     report.evaluate(true_df, pred_df)
     return report
+
+
+@dataclass(frozen=True)
+class TargetGroupMapping:
+    """Maps output targets to logical groups for calibration/analysis."""
+
+    group_to_columns: Dict[str, List[str]]
+    column_to_group: Dict[str, str]
+    group_to_indices: Dict[str, List[int]]
+
+    def to_serializable(self) -> Dict[str, List[str]]:
+        """Return a JSON-serialisable copy of the group→columns map."""
+
+        return {group: list(cols) for group, cols in self.group_to_columns.items()}
+
+
+def _assign_membership(
+    target_cols: Sequence[str],
+    initial_membership: Mapping[str, str],
+) -> TargetGroupMapping:
+    target_list = list(target_cols)
+
+    normalized: Dict[str, List[str]] = {}
+    column_to_group: Dict[str, str] = {col: grp for col, grp in initial_membership.items()}
+    group_to_indices: Dict[str, List[int]] = {}
+
+    for idx, col in enumerate(target_list):
+        group = column_to_group.get(col)
+        if group is None:
+            group = col
+            column_to_group[col] = group
+        normalized.setdefault(group, []).append(col)
+        group_to_indices.setdefault(group, []).append(idx)
+
+    return TargetGroupMapping(normalized, column_to_group, group_to_indices)
+
+
+def _load_group_config(path: Path) -> Dict[str, Dict[str, List[str]]]:
+    try:
+        with Path(path).open("r") as handle:
+            payload = json.load(handle)
+    except Exception as exc:  # pragma: no cover - defensive path
+        raise ValueError(f"Failed to parse tau group config {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Tau group config must be a JSON object of group→patterns")
+
+    config: Dict[str, Dict[str, List[str]]] = {}
+    for group_name, patterns in payload.items():
+        explicit_cols: List[str] = []
+        regexes: List[str] = []
+        if isinstance(patterns, str):
+            regexes = [patterns]
+        elif isinstance(patterns, list):
+            if not all(isinstance(item, str) for item in patterns):
+                raise ValueError(
+                    f"Tau group config for '{group_name}' must contain only strings"
+                )
+            regexes = [str(item) for item in patterns]
+        elif isinstance(patterns, dict):
+            cols = patterns.get("columns", [])
+            pats = patterns.get("patterns", [])
+            if not all(isinstance(item, str) for item in cols):
+                raise ValueError(
+                    f"Tau group config for '{group_name}' has non-string entries under 'columns'"
+                )
+            if not all(isinstance(item, str) for item in pats):
+                raise ValueError(
+                    f"Tau group config for '{group_name}' has non-string entries under 'patterns'"
+                )
+            explicit_cols = [str(item) for item in cols]
+            regexes = [str(item) for item in pats]
+        else:
+            raise ValueError(
+                f"Unsupported entry for group '{group_name}'; expected string/list/dict"
+            )
+        if not explicit_cols and not regexes:
+            raise ValueError(
+                f"Group '{group_name}' in tau config must specify at least one column or pattern"
+            )
+        config[group_name] = {"columns": explicit_cols, "patterns": regexes}
+    return config
+
+
+def resolve_target_groups(
+    target_cols: Sequence[str],
+    *,
+    mode: str = "auto",
+    config_path: Optional[Path] = None,
+) -> Optional[TargetGroupMapping]:
+    """Determine grouping of output targets for tau scaling/calibration.
+
+    Parameters
+    ----------
+    target_cols:
+        Ordered list of output column names.
+    mode:
+        ``"none"`` skips grouping entirely. ``"auto"`` groups by leading
+        alphabetical prefix (matching ``^[A-Za-z]+``). ``"config"`` uses a
+        user-provided JSON mapping.
+    config_path:
+        Path to a JSON file mapping group names to regex patterns (or explicit
+        column lists) when ``mode="config"``.
+    """
+
+    mode_normalized = (mode or "auto").lower()
+    if mode_normalized not in {"none", "auto", "config"}:
+        raise ValueError(f"Unsupported tau group mode '{mode}'; expected none/auto/config")
+    if mode_normalized == "none":
+        return None
+
+    target_list = list(target_cols)
+    if not target_list:
+        return None
+
+    assigned: Dict[str, str] = {}
+
+    if mode_normalized == "config":
+        if config_path is None:
+            raise ValueError("per-group tau mode 'config' requires --per-group-tau-config")
+        pattern_map = _load_group_config(config_path)
+        used_columns: Dict[str, str] = {}
+        for group_name, spec in pattern_map.items():
+            matched_for_group: List[str] = []
+
+            for col in spec.get("columns", []):
+                if col not in target_list:
+                    raise ValueError(
+                        f"Column '{col}' listed under group '{group_name}' is not present in targets"
+                    )
+                previous = used_columns.get(col)
+                if previous is not None and previous != group_name:
+                    raise ValueError(
+                        f"Column '{col}' assigned to multiple tau groups: '{previous}' and '{group_name}'"
+                    )
+                used_columns[col] = group_name
+                if col not in matched_for_group:
+                    matched_for_group.append(col)
+
+            for pattern in spec.get("patterns", []):
+                try:
+                    regex = re.compile(pattern)
+                except re.error as exc:  # pragma: no cover - defensive path
+                    raise ValueError(
+                        f"Invalid regex '{pattern}' for group '{group_name}': {exc}"
+                    ) from exc
+                for col in target_list:
+                    if not regex.match(col):
+                        continue
+                    previous = used_columns.get(col)
+                    if previous is not None and previous != group_name:
+                        raise ValueError(
+                            f"Column '{col}' matched by multiple tau groups: '{previous}' and '{group_name}'"
+                        )
+                    used_columns[col] = group_name
+                    if col not in matched_for_group:
+                        matched_for_group.append(col)
+
+            if not matched_for_group:
+                raise ValueError(
+                    f"Group '{group_name}' in tau config did not match any target columns"
+                )
+
+        assigned = used_columns
+    else:  # auto mode
+        prefix_pattern = re.compile(r"^[A-Za-z]+")
+        for col in target_list:
+            match = prefix_pattern.match(col)
+            if match:
+                assigned[col] = match.group(0)
+
+    return _assign_membership(target_list, assigned)

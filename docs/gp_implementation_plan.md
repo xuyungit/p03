@@ -299,7 +299,7 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
     - SVGP：seed 42/7/1337，MAE 3.37±0.28，RMSE 14.36±1.24，raw 0.9 覆盖率 0.991±0.002，tau 缩放后 0.857±0.004。
   - [x] 在 `docs/` 补充使用命令与结果示例
     - 详见 `docs/gp_baseline_usage.md`，收录命令、复现实验目录与不确定性调校记录。
-  - [ ] 将分组 τ 缩放融入 `svgp_baseline` 推理/评估（例如加载 `per_group_tau.json` 自动应用）。
+  - [x] 将分组 τ 缩放融入 `svgp_baseline` 推理/评估（CLI 自动导出 `per_group_tau.json` 并在推理中加载）。
   - [ ] 探索覆盖率目标权重化或多分位联合校准（如同时约束 0.9/0.95），对比 per-group τ 的效果。
 
 - B 档：ICM/LMC 多任务（第二阶段）

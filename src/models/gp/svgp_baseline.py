@@ -26,7 +26,18 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.optim import lr_scheduler
 
 from models.evaluation.report import EvaluationReport
-from models.gp.common import GPDataConfig, GPDataModule, PCAPipelineConfig
+from models.gp.common import (
+    GPDataConfig,
+    GPDataModule,
+    PCAPipelineConfig,
+    TargetGroupMapping,
+    resolve_target_groups,
+)
+from models.gp.uncertainty import (
+    build_uncertainty_summary,
+    calibrate_global_tau,
+    calibrate_groupwise_tau,
+)
 from models.utils import ColumnSpec
 
 
@@ -77,6 +88,8 @@ class CLIConfig:
     print_freq: int = 50
     val_interval: int = 50
     coverage_levels: List[float] = field(default_factory=lambda: [0.5, 0.9, 0.95])
+    per_group_tau_mode: str = "auto"
+    per_group_tau_config: Optional[Path] = None
 
     pca_enable: bool = True
     pca_variance: float = 0.98
@@ -155,6 +168,19 @@ def _parse_args() -> CLIConfig:
     parser.add_argument("--print-freq", type=int, default=50)
     parser.add_argument("--val-interval", type=int, default=50)
     parser.add_argument("--coverage-list", type=str, default="0.5,0.9,0.95")
+    parser.add_argument(
+        "--per-group-tau-mode",
+        type=str,
+        default="auto",
+        choices=["none", "auto", "config"],
+        help="Strategy for grouping targets when calibrating per-group tau scaling",
+    )
+    parser.add_argument(
+        "--per-group-tau-config",
+        type=Path,
+        default=None,
+        help="JSON mapping of group name to column patterns (required if mode=config)",
+    )
 
     parser.add_argument("--no-pca", action="store_true")
     parser.add_argument("--pca-variance", type=float, default=0.98)
@@ -191,6 +217,15 @@ def _parse_args() -> CLIConfig:
         if not 0.0 < level < 1.0:
             raise SystemExit(f"Coverage levels must be in (0, 1); received {level}")
 
+    per_group_tau_mode = str(args.per_group_tau_mode or "auto").lower()
+    per_group_tau_config = args.per_group_tau_config
+    if per_group_tau_mode not in {"none", "auto", "config"}:
+        raise SystemExit(
+            f"Unsupported --per-group-tau-mode '{args.per_group_tau_mode}'; use none/auto/config"
+        )
+    if per_group_tau_mode == "config" and per_group_tau_config is None:
+        raise SystemExit("--per-group-tau-config is required when --per-group-tau-mode=config")
+
     cfg = CLIConfig(
         train_csv=list(args.train_csv),
         test_csv=list(args.test_csv),
@@ -226,6 +261,8 @@ def _parse_args() -> CLIConfig:
         print_freq=max(1, args.print_freq),
         val_interval=max(1, args.val_interval),
         coverage_levels=coverage_levels,
+        per_group_tau_mode=per_group_tau_mode,
+        per_group_tau_config=per_group_tau_config,
         pca_enable=not args.no_pca,
         pca_variance=args.pca_variance,
         pca_components=args.pca_components,
@@ -326,6 +363,14 @@ def _apply_preset(cfg: CLIConfig) -> CLIConfig:
         updated.experiment_root = Path(payload["experiment_root"])
     if updated.error_feature_names is None and payload.get("error_feature_names"):
         updated.error_feature_names = [str(x) for x in payload["error_feature_names"]]
+    if "per_group_tau_mode" in payload:
+        updated.per_group_tau_mode = str(payload["per_group_tau_mode"]).lower()
+    if (
+        "per_group_tau_config" in payload
+        and updated.per_group_tau_config is None
+        and payload["per_group_tau_config"] is not None
+    ):
+        updated.per_group_tau_config = Path(payload["per_group_tau_config"])
 
     return updated
 
@@ -710,6 +755,7 @@ def _save_config(
     cfg: CLIConfig,
     input_cols: Sequence[str],
     target_cols: Sequence[str],
+    group_mapping: Optional[TargetGroupMapping],
 ) -> None:
     cfg_dict = asdict(cfg)
     cfg_dict["train_csv"] = [str(p) for p in cfg.train_csv]
@@ -718,8 +764,12 @@ def _save_config(
         cfg_dict["augment_config"] = str(cfg.augment_config)
     if cfg.experiment_root is not None:
         cfg_dict["experiment_root"] = str(cfg.experiment_root)
+    if cfg.per_group_tau_config is not None:
+        cfg_dict["per_group_tau_config"] = str(cfg.per_group_tau_config)
     cfg_dict["resolved_input_cols"] = list(input_cols)
     cfg_dict["resolved_target_cols"] = list(target_cols)
+    if group_mapping is not None:
+        cfg_dict["target_group_map"] = group_mapping.to_serializable()
     with (run_dir / "config.json").open("w") as handle:
         json.dump(cfg_dict, handle, indent=2)
 
@@ -780,126 +830,6 @@ def _save_report(
         std_df.to_csv(run_dir / f"{split_name}_pred_std.csv", index=False)
 
 
-def _normal_quantile(prob: float) -> float:
-    if not 0.0 < prob < 1.0:
-        raise ValueError(f"Quantile probability must be in (0, 1); received {prob}")
-    tensor = torch.tensor(prob, dtype=torch.float64)
-    quantile = torch.distributions.Normal(torch.tensor(0.0, dtype=torch.float64), torch.tensor(1.0, dtype=torch.float64)).icdf(tensor)
-    return float(quantile.item())
-
-
-def _gaussian_nll_matrix(y_true: np.ndarray, y_pred: np.ndarray, y_std: np.ndarray) -> np.ndarray:
-    eps = 1e-9
-    std = np.maximum(y_std, eps)
-    var = np.square(std)
-    residual = y_true - y_pred
-    return 0.5 * (np.log(2.0 * np.pi * var) + np.square(residual) / var)
-
-
-def _coverage_mask(y_true: np.ndarray, y_pred: np.ndarray, y_std: np.ndarray, level: float) -> np.ndarray:
-    alpha = 0.5 + level / 2.0
-    z_value = _normal_quantile(alpha)
-    margin = z_value * y_std
-    lower = y_pred - margin
-    upper = y_pred + margin
-    return (y_true >= lower) & (y_true <= upper)
-
-
-def _build_uncertainty_summary(
-    true_df: pd.DataFrame,
-    pred_df: pd.DataFrame,
-    std_df: Optional[pd.DataFrame],
-    coverage_levels: Sequence[float],
-    *,
-    tau: Optional[float] = None,
-) -> Optional[Dict[str, object]]:
-    if std_df is None:
-        return None
-
-    y_true = true_df.to_numpy(dtype=np.float64, copy=False)
-    y_pred = pred_df.to_numpy(dtype=np.float64, copy=False)
-    y_std = std_df.to_numpy(dtype=np.float64, copy=False)
-
-    payload: Dict[str, object] = {"coverage_levels": [float(level) for level in coverage_levels]}
-
-    def _summarize(std: np.ndarray) -> Dict[str, object]:
-        nll_matrix = _gaussian_nll_matrix(y_true, y_pred, std)
-        nll_overall = float(np.mean(nll_matrix))
-        nll_per_target = {
-            col: float(np.mean(nll_matrix[:, idx])) for idx, col in enumerate(true_df.columns)
-        }
-
-        coverage_summary: Dict[str, Dict[str, object]] = {}
-        for level in coverage_levels:
-            mask = _coverage_mask(y_true, y_pred, std, level)
-            coverage_summary[str(level)] = {
-                "overall": float(np.mean(mask)),
-                "per_target": {
-                    col: float(np.mean(mask[:, idx])) for idx, col in enumerate(true_df.columns)
-                },
-            }
-        return {"nll": {"overall": nll_overall, "per_target": nll_per_target}, "coverage": coverage_summary}
-
-    payload["raw"] = _summarize(y_std)
-
-    if tau is not None:
-        scaled = y_std * float(tau)
-        scaled_summary = _summarize(scaled)
-        payload["tau_scaled"] = {"value": float(tau), **scaled_summary}
-
-    return payload
-
-
-def _calibrate_tau(
-    true_df: pd.DataFrame,
-    pred_df: pd.DataFrame,
-    std_df: Optional[pd.DataFrame],
-    coverage_levels: Sequence[float],
-) -> Optional[float]:
-    if std_df is None or std_df.empty:
-        return None
-
-    y_true = true_df.to_numpy(dtype=np.float64, copy=False)
-    y_pred = pred_df.to_numpy(dtype=np.float64, copy=False)
-    y_std = std_df.to_numpy(dtype=np.float64, copy=False)
-
-    valid_levels = [level for level in coverage_levels if 0.0 < level < 1.0]
-    if not valid_levels:
-        return None
-
-    def objective(tau_value: float) -> float:
-        std_scaled = y_std * tau_value
-        error = 0.0
-        for level in valid_levels:
-            mask = _coverage_mask(y_true, y_pred, std_scaled, level)
-            coverage = float(np.mean(mask))
-            error += (coverage - level) ** 2
-        return error
-
-    # Coarse-to-fine search on a log scale
-    search_grid = np.logspace(-1, 1, num=60)
-    best_tau = 1.0
-    best_error = float("inf")
-    for candidate in search_grid:
-        err = objective(candidate)
-        if err < best_error:
-            best_error = err
-            best_tau = candidate
-
-    fine_lower = max(best_tau * 0.25, 1e-3)
-    fine_upper = best_tau * 4.0
-    fine_grid = np.linspace(fine_lower, fine_upper, num=80)
-    for candidate in fine_grid:
-        if candidate <= 0.0:
-            continue
-        err = objective(candidate)
-        if err < best_error:
-            best_error = err
-            best_tau = candidate
-
-    return float(best_tau)
-
-
 def _write_uncertainty_metrics(
     run_dir: Path,
     split_name: str,
@@ -956,8 +886,18 @@ def main() -> None:
     data_module = GPDataModule(data_cfg)
     data_module.setup()
     data_module.save_preprocessors(run_dir / "checkpoints")
+    try:
+        group_mapping = resolve_target_groups(
+            data_module.target_cols,
+            mode=cfg.per_group_tau_mode,
+            config_path=cfg.per_group_tau_config,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"Failed to resolve target groups: {exc}") from exc
 
-    _save_config(run_dir, cfg, data_module.input_cols, data_module.target_cols)
+    _save_config(run_dir, cfg, data_module.input_cols, data_module.target_cols, group_mapping)
+
+    group_indices = group_mapping.group_to_indices if group_mapping is not None else None
 
     train_inputs, train_latent = data_module.train_arrays()
     val_arrays = data_module.val_arrays()
@@ -1018,10 +958,17 @@ def main() -> None:
     _write_uncertainty_metrics(
         run_dir,
         "train",
-        _build_uncertainty_summary(train_true_df, train_pred_df, train_std_df, cfg.coverage_levels),
+        build_uncertainty_summary(
+            train_true_df,
+            train_pred_df,
+            train_std_df,
+            cfg.coverage_levels,
+            group_indices=group_indices,
+        ),
     )
 
     tau_value: Optional[float] = None
+    per_group_tau: Dict[str, float] = {}
     if val_inputs is not None and val_latent is not None:
         val_mean_latent, val_var_latent = _predict_components(components, val_inputs, batch_size=cfg.batch_size, device=device)
         val_input_df, val_true_df, val_pred_df, val_std_df = _prepare_split_frames(
@@ -1040,13 +987,23 @@ def main() -> None:
             std_df=val_std_df if cfg.save_std else None,
             error_feature_names=cfg.error_feature_names,
         )
-        tau_value = _calibrate_tau(val_true_df, val_pred_df, val_std_df, cfg.coverage_levels)
-        val_uncertainty = _build_uncertainty_summary(
+        tau_value = calibrate_global_tau(val_true_df, val_pred_df, val_std_df, cfg.coverage_levels)
+        if group_indices and cfg.per_group_tau_mode != "none":
+            per_group_tau = calibrate_groupwise_tau(
+                val_true_df,
+                val_pred_df,
+                val_std_df,
+                cfg.coverage_levels,
+                group_indices,
+            )
+        val_uncertainty = build_uncertainty_summary(
             val_true_df,
             val_pred_df,
             val_std_df,
             cfg.coverage_levels,
-            tau=tau_value,
+            global_tau=tau_value,
+            per_group_tau=per_group_tau,
+            group_indices=group_indices,
         )
         _write_uncertainty_metrics(run_dir, "val", val_uncertainty)
         if tau_value is not None:
@@ -1056,6 +1013,19 @@ def main() -> None:
                         "value": float(tau_value),
                         "source": "val",
                         "coverage_levels": [float(level) for level in cfg.coverage_levels],
+                    },
+                    handle,
+                    indent=2,
+                )
+        if per_group_tau:
+            with (run_dir / "per_group_tau.json").open("w") as handle:
+                json.dump(
+                    {
+                        "values": {k: float(v) for k, v in per_group_tau.items()},
+                        "source": "val",
+                        "coverage_levels": [float(level) for level in cfg.coverage_levels],
+                        "groups": group_mapping.to_serializable() if group_mapping is not None else {},
+                        "mode": cfg.per_group_tau_mode,
                     },
                     handle,
                     indent=2,
@@ -1081,12 +1051,14 @@ def main() -> None:
     _write_uncertainty_metrics(
         run_dir,
         "test",
-        _build_uncertainty_summary(
+        build_uncertainty_summary(
             test_true_df,
             test_pred_df,
             test_std_df,
             cfg.coverage_levels,
-            tau=tau_value,
+            global_tau=tau_value,
+            per_group_tau=per_group_tau,
+            group_indices=group_indices,
         ),
     )
 
@@ -1117,7 +1089,15 @@ def main() -> None:
             _write_uncertainty_metrics(
                 run_dir,
                 split_name,
-                _build_uncertainty_summary(true_df, pred_df, std_df, cfg.coverage_levels, tau=tau_value),
+                build_uncertainty_summary(
+                    true_df,
+                    pred_df,
+                    std_df,
+                    cfg.coverage_levels,
+                    global_tau=tau_value,
+                    per_group_tau=per_group_tau,
+                    group_indices=group_indices,
+                ),
             )
 
     print(f"Run artifacts saved to {run_dir}")
