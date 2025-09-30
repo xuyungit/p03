@@ -299,11 +299,15 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
     - SVGP：seed 42/7/1337，MAE 3.37±0.28，RMSE 14.36±1.24，raw 0.9 覆盖率 0.991±0.002，tau 缩放后 0.857±0.004。
   - [x] 在 `docs/` 补充使用命令与结果示例
     - 详见 `docs/gp_baseline_usage.md`，收录命令、复现实验目录与不确定性调校记录。
+  - [x] 将分组 τ 缩放融入 `mt_icm.py` 推理/评估（内置自动应用）。
+  - [x] 探索覆盖率目标权重化或多分位联合校准（如同时约束 0.9/0.95），对比 per-group τ 的效果。
   - [ ] 将分组 τ 缩放融入 `svgp_baseline` 推理/评估（例如加载 `per_group_tau.json` 自动应用）。
-  - [ ] 探索覆盖率目标权重化或多分位联合校准（如同时约束 0.9/0.95），对比 per-group τ 的效果。
 
 - B 档：ICM/LMC 多任务（第二阶段）
-  - [ ] 实现 `src/models/gp/mt_icm.py`（变分多任务）
+  - [x] 实现 `src/models/gp/mt_icm.py`（变分多任务）
+    - 支持 ICM（全秩）和 LMC（低秩）核函数
+    - 内置 per-group tau 缩放，自动按目标列分组优化覆盖率
+    - 保存任务协方差矩阵用于分析输出间相关性
   - [ ] 任务协方差保存与可视化
   - [ ] 对比实验与结论
 
@@ -320,9 +324,35 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
   - [x] T+0.5d 完成公共函数与 PCA 管道
   - [x] T+1.5d SVGP 基线训练/评估打通
   - [x] T+2d 不确定性指标与文档
-  - [ ] T+3d 推进 B/C 或调优 A
+  - [x] T+3d 推进 B/C 或调优 A - 完成 B 档 mt_icm.py 实现与 per-group tau 集成
 
-24. 其他畅想
+24. Multi-task ICM/LMC 使用指南
+
+B 档多任务 SVGP 命令示例：
+```bash
+# ICM（全秩）多任务 GP
+uv run python src/models/gp/mt_icm.py \
+  --train-csv data/d3d04_all_train_r.csv data/m2_0914_r_all_train.csv data/m2_lhs_0916_train.csv \
+  --test-csv data/d3d04_all_test_r.csv data/m2_0914_r_all_test.csv data/m2_lhs_0916_test.csv \
+  --input-cols-re '^F[1-6]$, ^N[0-9]+_r$, T_grad' \
+  --target-cols-re '^R[0-9]+$, ^Ry_t[0-9]+$, ^Rx_t[0-9]+$, D_t[0-9]+_r$' \
+  --kernel rbf --ard --inducing 512 --pca-variance 0.98 \
+  --enable-per-group-tau --group-patterns '^R[0-9]+$' '^Ry_t[0-9]+$' '^Rx_t[0-9]+$' '^D_t[0-9]+_r$'
+
+# LMC（低秩）多任务 GP - 更高效的参数化
+uv run python src/models/gp/mt_icm.py \
+  --train-csv ... --test-csv ... \
+  --input-cols-re ... --target-cols-re ... \
+  --lmc-rank 5 --epochs 1000
+```
+
+关键特性：
+- **ICM vs LMC**: ICM 学习完整的任务协方差矩阵，LMC 使用低秩近似（更高效）
+- **Per-group tau**: 自动为不同目标列组优化不确定性校准
+- **任务协方差**: 保存为 `task_covariance.npy`，可分析输出维度间相关性
+- **统一评估**: 与 SVGP 基线保持一致的评估指标和可视化
+
+25. 其他畅想
 - 能否基于PCA的分析，减少模型的输入维度，比如根据PCA的分析，哪些维度是冗余的，哪些维度是重要的，哪些维度是相关的，哪些维度是无关的，从而减少模型的输入维度。
 - 是否可以进行并发
 - 如何得到概率分布，而不是单一的点预测
