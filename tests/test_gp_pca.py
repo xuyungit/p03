@@ -4,6 +4,16 @@ from numpy.testing import assert_allclose
 from models.gp.common import PCAPipeline, PCAPipelineConfig
 
 
+def test_inverse_transform_recovers_input_when_full_rank():
+    data = np.random.RandomState(42).normal(size=(32, 2))
+    pipeline = PCAPipeline(PCAPipelineConfig(n_components=2))
+    pipeline.fit(data)
+
+    latent = pipeline.transform(data)
+    reconstructed = pipeline.inverse_transform(latent)
+    assert_allclose(reconstructed, data, rtol=1e-09, atol=1e-10)
+
+
 def test_project_latent_variance_matches_manual_projection():
     data = np.array(
         [
