@@ -2,7 +2,7 @@
 Tree-based baseline for rev03 tabular mechanics mappings.
 
 This script mirrors the data handling and reporting pipeline of
-``rev03_rtd_nf_e3_enhanced.py`` but trains a gradient-boosted tree model
+neural network implementaton but trains a gradient-boosted tree model
 instead of a neural network so the two approaches can be compared
 side-by-side.
 """
@@ -75,8 +75,6 @@ def set_all_seeds(seed: int = 42) -> None:
 
 def _module_base_name() -> str:
     stem = Path(__file__).stem
-    if stem.endswith("_enhanced"):
-        stem = stem[: -len("_enhanced")]
     return stem
 
 

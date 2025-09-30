@@ -1,7 +1,7 @@
 """
-Hyperparameter search harness for rev03_rtd_nf_e3_enhanced.
+Hyperparameter search harness for bridge_nn.
 
-This script orchestrates multiple runs of `models/rev03_rtd_nf_e3_enhanced.py`
+This script orchestrates multiple runs of `models/bridge_nn.py`
 with different hyperparameters, collects validation/test metrics, and writes a
 summary CSV. It keeps per-trial artifacts isolated and reproducible.
 
@@ -139,7 +139,7 @@ def _parse_grid(tokens: List[str]) -> Dict[str, List[str]]:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Hyperparameter search for rev03 enhanced trainer")
+    p = argparse.ArgumentParser(description="Hyperparameter search bridge nn trainer")
     # Data and columns
     p.add_argument("--train-csv", type=Path, nargs='+', required=True)
     p.add_argument("--test-csv", type=Path, nargs='+', required=True)
@@ -277,7 +277,7 @@ def _load_completed_signatures(summary_path: Path) -> List[Tuple[str, Dict[str, 
 
 
 def _build_train_cmd(base: BaseArgs, overrides: Dict[str, str], exp_root: Path) -> List[str]:
-    script = str(Path("models") / "rev03_rtd_nf_e3_enhanced.py")
+    script = str(Path("models") / "bridge_nn.py")
     cmd: List[str] = [sys.executable, script]
 
     # Data

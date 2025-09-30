@@ -1,5 +1,5 @@
 """
-rev03_rtd_nf_e3_enhanced
+Using neural network to train the model for bridge components.
 
 Phase 0 enhanced training script:
 - Full-epoch training with DataLoaders
@@ -109,7 +109,7 @@ class CLIConfig:
 
 
 def _parse_args() -> CLIConfig:
-    p = argparse.ArgumentParser(description="rev03 enhanced training for RD->FN model")
+    p = argparse.ArgumentParser(description="Using neural network to train the model for bridge components.")
     # Allow one or more training CSV files
     p.add_argument("--train-csv", type=Path, nargs='+', default=[Path("data/d03_all_train.csv")])
     p.add_argument("--test-csv", type=Path, nargs='+', default=[Path("data/d03_all_test.csv")])
@@ -344,8 +344,6 @@ def _parse_args() -> CLIConfig:
 def _module_base_name() -> str:
     # Use file stem and strip common suffix like _enhanced
     stem = Path(__file__).stem
-    if stem.endswith("_enhanced"):
-        stem = stem[: -len("_enhanced")]
     return stem
 
 
