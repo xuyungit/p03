@@ -183,6 +183,7 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
     - 可选预热阶段：仅更新噪声方差与长度尺度若干 epoch；随后解冻全参联合训练。
     - 优化：Adam；学习率调度（cosine/step/none）；可选对变分参数用自然梯度（迭代交替）。
     - 验证：每 `val_interval` 个 epoch 在验证集计算 NLL/RMSE；保存 best/last。
+    - CLI 已支持 `--prewarm-epochs`、`--early-stopping`、`--patience`、`--min-delta` 配置预热与早停策略。
   - 评估：
     - 生成 `train/val/test` 与每个单独测试文件的预测 CSV（均值），以及 `*_std.csv`（若 `--save-std`）。
     - 通过 `EvaluationReport` 产出 `*_metrics.json`、`*_predictions.png`、`*_residuals.png`、文本报告等（与 NN/Tree 一致）。
@@ -199,6 +200,7 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
 - 覆盖率：对每个样本/维度，统计 `[μ ± z_α σ]` 是否覆盖真实值；默认 α=1.64(90%)、1.96(95%)；输出总体覆盖率与分维覆盖率。
 - NLL：以高斯似然近似 `-log p(y|μ,σ)` 的均值（原单位）。
 - 温度缩放：在验证集搜索一个全局方差缩放系数 `τ`，使目标覆盖率更贴近名义值（保存 `tau.json`）。
+- 当前 CLI 会生成 `*_uncertainty.json`（raw 与 `τ` 校准的覆盖率、NLL）及 `tau.json` 记录验证集标定结果。
 
 16. 与现有代码的对齐与复用
 - 列选择/校验：直接复用 `bridge_nn.py`/`rev03_rtd_nf_e3_tree.py` 的正则解析与“逐文件校验”逻辑，抽取为公共函数，避免多处重复。
@@ -270,9 +272,10 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
 - A 档：SVGP 基线
   - [x] 实现 `src/models/gp/svgp_baseline.py`（CLI 与 NN/Tree 对齐）
   - [x] 支持核选择（RBF/Matérn）、ARD、诱导点初始化（kmeans/random）
-  - [ ] 小批量训练循环（预热→联合），学习率调度与早停
-  - [ ] 产物保存：`config.json`、`checkpoints`、`scaler_x.pkl`、`scaler_y.pkl`、`pca.pkl`、预测 CSV/图表
-  - [ ] 不确定性：保存 `std`、覆盖率、NLL、温度缩放 `τ`
+  - [x] 小批量训练循环（预热→联合）与早停
+  - [ ] 学习率调度
+  - [x] 产物保存：`config.json`、`checkpoints`、`scaler_x.pkl`、`scaler_y.pkl`、`pca.pkl`、预测 CSV/图表
+  - [x] 不确定性：保存 `std`、覆盖率、NLL、温度缩放 `τ`
   - [ ] 推理：`src/models/gp/infer.py` 输出均值/方差
   - [ ] 冒烟：小规模数据完整跑通并生成产物
 
@@ -304,6 +307,6 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
 
 - 里程碑检查
   - [x] T+0.5d 完成公共函数与 PCA 管道
-  - [ ] T+1.5d SVGP 基线训练/评估打通
-  - [ ] T+2d 不确定性指标与文档
+  - [x] T+1.5d SVGP 基线训练/评估打通
+  - [x] T+2d 不确定性指标与文档
   - [ ] T+3d 推进 B/C 或调优 A

@@ -8,10 +8,11 @@ artifacts remain comparable across model families.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -53,6 +54,10 @@ class CLIConfig:
     batch_size: int = 256
     epochs: int = 300
     lr: float = 1e-2
+    prewarm_epochs: int = 25
+    early_stopping: bool = False
+    patience: int = 50
+    min_delta: float = 0.0
     seed: int = 42
     device: str = "cpu"
 
@@ -66,6 +71,7 @@ class CLIConfig:
     save_std: bool = True
     print_freq: int = 50
     val_interval: int = 50
+    coverage_levels: List[float] = field(default_factory=lambda: [0.5, 0.9, 0.95])
 
     pca_enable: bool = True
     pca_variance: float = 0.98
@@ -85,6 +91,16 @@ def _split_tokens(raw: Optional[str]) -> Optional[List[str]]:
     return values or None
 
 
+def _split_float_tokens(raw: Optional[str]) -> Optional[List[float]]:
+    tokens = _split_tokens(raw)
+    if tokens is None:
+        return None
+    try:
+        return [float(tok) for tok in tokens]
+    except ValueError as exc:  # pragma: no cover - defensive path
+        raise SystemExit(f"Failed to parse float list from '{raw}': {exc}") from exc
+
+
 def _maybe_path_list(value: object) -> List[Path]:
     if isinstance(value, (list, tuple)):
         return [Path(v) for v in value]
@@ -98,9 +114,13 @@ def _parse_args() -> CLIConfig:
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--epochs", type=int, default=300)
+    parser.add_argument("--prewarm-epochs", type=int, default=25)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--early-stopping", action="store_true")
+    parser.add_argument("--patience", type=int, default=50)
+    parser.add_argument("--min-delta", type=float, default=0.0)
 
     parser.add_argument("--augment-flip", action="store_true")
     parser.add_argument("--no-augment-flip", action="store_true")
@@ -125,6 +145,7 @@ def _parse_args() -> CLIConfig:
     parser.add_argument("--no-save-std", action="store_true")
     parser.add_argument("--print-freq", type=int, default=50)
     parser.add_argument("--val-interval", type=int, default=50)
+    parser.add_argument("--coverage-list", type=str, default="0.5,0.9,0.95")
 
     parser.add_argument("--no-pca", action="store_true")
     parser.add_argument("--pca-variance", type=float, default=0.98)
@@ -154,6 +175,13 @@ def _parse_args() -> CLIConfig:
     elif args.save_std:
         save_std = True
 
+    coverage_levels = _split_float_tokens(args.coverage_list)
+    if not coverage_levels:
+        coverage_levels = [0.5, 0.9, 0.95]
+    for level in coverage_levels:
+        if not 0.0 < level < 1.0:
+            raise SystemExit(f"Coverage levels must be in (0, 1); received {level}")
+
     cfg = CLIConfig(
         train_csv=list(args.train_csv),
         test_csv=list(args.test_csv),
@@ -168,7 +196,11 @@ def _parse_args() -> CLIConfig:
         preset=args.preset,
         batch_size=args.batch_size,
         epochs=args.epochs,
+        prewarm_epochs=max(0, args.prewarm_epochs),
         lr=args.lr,
+        early_stopping=args.early_stopping,
+        patience=max(1, args.patience),
+        min_delta=float(args.min_delta),
         seed=args.seed,
         device=args.device,
         kernel=args.kernel,
@@ -180,6 +212,7 @@ def _parse_args() -> CLIConfig:
         save_std=save_std,
         print_freq=max(1, args.print_freq),
         val_interval=max(1, args.val_interval),
+        coverage_levels=coverage_levels,
         pca_enable=not args.no_pca,
         pca_variance=args.pca_variance,
         pca_components=args.pca_components,
@@ -223,9 +256,26 @@ def _apply_preset(cfg: CLIConfig) -> CLIConfig:
     if updated.target_cols_re is None and payload.get("target_cols_re"):
         updated.target_cols_re = [str(x) for x in payload["target_cols_re"]]
 
-    for key in ("batch_size", "epochs", "lr", "seed", "kernel", "ard", "inducing", "inducing_init", "noise_init", "jitter", "pca_enable", "pca_variance", "pca_components", "pca_max_components"):
+    for key in (
+        "batch_size",
+        "epochs",
+        "lr",
+        "seed",
+        "kernel",
+        "ard",
+        "inducing",
+        "inducing_init",
+        "noise_init",
+        "jitter",
+        "pca_enable",
+        "pca_variance",
+        "pca_components",
+        "pca_max_components",
+    ):
         if key in payload:
             setattr(updated, key, payload[key])
+    if "prewarm_epochs" in payload:
+        updated.prewarm_epochs = max(0, int(payload["prewarm_epochs"]))
     if "device" in payload and cfg.device == "cpu":
         updated.device = str(payload["device"])
     if "save_std" in payload:
@@ -234,6 +284,27 @@ def _apply_preset(cfg: CLIConfig) -> CLIConfig:
         updated.print_freq = int(payload["print_freq"])
     if "val_interval" in payload:
         updated.val_interval = int(payload["val_interval"])
+    if "early_stopping" in payload:
+        updated.early_stopping = bool(payload["early_stopping"])
+    if "patience" in payload:
+        updated.patience = max(1, int(payload["patience"]))
+    if "min_delta" in payload:
+        updated.min_delta = float(payload["min_delta"])
+    if "coverage_levels" in payload:
+        raw_levels = payload["coverage_levels"]
+        if isinstance(raw_levels, str):
+            levels = _split_float_tokens(raw_levels)
+        else:
+            try:
+                levels = [float(x) for x in raw_levels]
+            except TypeError as exc:  # pragma: no cover - defensive path
+                raise SystemExit(f"Invalid coverage_levels in preset: {raw_levels}") from exc
+        if not levels:
+            raise SystemExit("coverage_levels in preset must not be empty")
+        for lvl in levels:
+            if not 0.0 < lvl < 1.0:
+                raise SystemExit(f"Preset coverage level {lvl} must be in (0, 1)")
+        updated.coverage_levels = levels
     if "experiment_root" in payload and cfg.experiment_root is None:
         updated.experiment_root = Path(payload["experiment_root"])
     if updated.error_feature_names is None and payload.get("error_feature_names"):
@@ -310,6 +381,36 @@ def _init_inducing_points(
     else:  # pragma: no cover - validated by argparse choices
         raise ValueError(f"Unsupported inducing init: {method}")
     return torch.from_numpy(centers)
+
+
+def _set_prewarm_mode(
+    model: SingleTaskSVGP,
+    likelihood: gpytorch.likelihoods.GaussianLikelihood,
+    *,
+    enable: bool,
+) -> None:
+    """Freeze/unfreeze parameters for the pre-warm stage.
+
+    When ``enable`` is True we only allow the kernel lengthscales and noise term
+    to update; all other parameters are temporarily frozen.
+    """
+
+    for param in model.variational_parameters():
+        param.requires_grad = not enable
+
+    inducing_points = getattr(model.variational_strategy, "inducing_points", None)
+    if isinstance(inducing_points, torch.nn.Parameter):
+        inducing_points.requires_grad = not enable
+
+    base_kernel = getattr(model.covar_module, "base_kernel", None)
+    if base_kernel is not None and hasattr(base_kernel, "raw_lengthscale"):
+        base_kernel.raw_lengthscale.requires_grad = True
+
+    if hasattr(model.covar_module, "raw_outputscale"):
+        model.covar_module.raw_outputscale.requires_grad = not enable
+
+    if hasattr(likelihood, "raw_noise"):
+        likelihood.raw_noise.requires_grad = True
 
 
 class SingleTaskSVGP(gpytorch.models.ApproximateGP):
@@ -406,8 +507,23 @@ def _train_component(
     )
     mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=num_data)
 
+    prewarm_epochs = min(max(0, int(cfg.prewarm_epochs)), max(0, cfg.epochs - 1))
+    prewarm_active = prewarm_epochs > 0
+    if prewarm_active:
+        _set_prewarm_mode(model, likelihood, enable=True)
+
+    use_early_stopping = bool(cfg.early_stopping and val_loader is not None)
+    best_val = float("inf")
+    best_epoch: Optional[int] = None
+    epochs_no_improve = 0
+    best_state: Optional[Dict[str, Dict[str, torch.Tensor]]] = None
+
     history: List[Dict[str, float]] = []
     for epoch in range(1, cfg.epochs + 1):
+        if prewarm_active and epoch == prewarm_epochs + 1:
+            _set_prewarm_mode(model, likelihood, enable=False)
+            prewarm_active = False
+
         model.train()
         likelihood.train()
 
@@ -429,8 +545,27 @@ def _train_component(
 
         avg_loss = running_loss / max(1, batch_count)
         val_rmse: Optional[float] = None
-        if val_loader is not None and epoch % cfg.val_interval == 0:
+        should_eval = False
+        if val_loader is not None:
+            if use_early_stopping:
+                should_eval = True
+            elif epoch % cfg.val_interval == 0:
+                should_eval = True
+        if should_eval:
             val_rmse = _estimate_rmse(model, likelihood, val_loader, device)
+            improved = val_rmse < (best_val - cfg.min_delta)
+            if improved:
+                best_val = val_rmse
+                best_epoch = epoch
+                best_state = {
+                    "model": copy.deepcopy(model.state_dict()),
+                    "likelihood": copy.deepcopy(likelihood.state_dict()),
+                }
+                epochs_no_improve = 0
+            elif use_early_stopping and epoch > prewarm_epochs:
+                epochs_no_improve += 1
+        elif use_early_stopping and epoch > prewarm_epochs:
+            epochs_no_improve += 1
 
         history.append(
             {
@@ -438,6 +573,7 @@ def _train_component(
                 "epoch": float(epoch),
                 "train_elbo": avg_loss,
                 "val_rmse": float(val_rmse) if val_rmse is not None else float("nan"),
+                "prewarm": 1.0 if epoch <= prewarm_epochs else 0.0,
             }
         )
 
@@ -446,6 +582,17 @@ def _train_component(
             if val_rmse is not None:
                 msg += f" | val RMSE {val_rmse:.4f}"
             print(msg)
+
+        if use_early_stopping and epoch > prewarm_epochs and epochs_no_improve >= cfg.patience:
+            print(
+                f"Early stopping component {component_idx:02d} after {epoch} epochs; "
+                f"best val RMSE {best_val:.4f} at epoch {best_epoch}"
+            )
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state["model"])
+        likelihood.load_state_dict(best_state["likelihood"])
 
     model.cpu()
     likelihood.cpu()
@@ -594,6 +741,138 @@ def _save_report(
         std_df.to_csv(run_dir / f"{split_name}_pred_std.csv", index=False)
 
 
+def _normal_quantile(prob: float) -> float:
+    if not 0.0 < prob < 1.0:
+        raise ValueError(f"Quantile probability must be in (0, 1); received {prob}")
+    tensor = torch.tensor(prob, dtype=torch.float64)
+    quantile = torch.distributions.Normal(torch.tensor(0.0, dtype=torch.float64), torch.tensor(1.0, dtype=torch.float64)).icdf(tensor)
+    return float(quantile.item())
+
+
+def _gaussian_nll_matrix(y_true: np.ndarray, y_pred: np.ndarray, y_std: np.ndarray) -> np.ndarray:
+    eps = 1e-9
+    std = np.maximum(y_std, eps)
+    var = np.square(std)
+    residual = y_true - y_pred
+    return 0.5 * (np.log(2.0 * np.pi * var) + np.square(residual) / var)
+
+
+def _coverage_mask(y_true: np.ndarray, y_pred: np.ndarray, y_std: np.ndarray, level: float) -> np.ndarray:
+    alpha = 0.5 + level / 2.0
+    z_value = _normal_quantile(alpha)
+    margin = z_value * y_std
+    lower = y_pred - margin
+    upper = y_pred + margin
+    return (y_true >= lower) & (y_true <= upper)
+
+
+def _build_uncertainty_summary(
+    true_df: pd.DataFrame,
+    pred_df: pd.DataFrame,
+    std_df: Optional[pd.DataFrame],
+    coverage_levels: Sequence[float],
+    *,
+    tau: Optional[float] = None,
+) -> Optional[Dict[str, object]]:
+    if std_df is None:
+        return None
+
+    y_true = true_df.to_numpy(dtype=np.float64, copy=False)
+    y_pred = pred_df.to_numpy(dtype=np.float64, copy=False)
+    y_std = std_df.to_numpy(dtype=np.float64, copy=False)
+
+    payload: Dict[str, object] = {"coverage_levels": [float(level) for level in coverage_levels]}
+
+    def _summarize(std: np.ndarray) -> Dict[str, object]:
+        nll_matrix = _gaussian_nll_matrix(y_true, y_pred, std)
+        nll_overall = float(np.mean(nll_matrix))
+        nll_per_target = {
+            col: float(np.mean(nll_matrix[:, idx])) for idx, col in enumerate(true_df.columns)
+        }
+
+        coverage_summary: Dict[str, Dict[str, object]] = {}
+        for level in coverage_levels:
+            mask = _coverage_mask(y_true, y_pred, std, level)
+            coverage_summary[str(level)] = {
+                "overall": float(np.mean(mask)),
+                "per_target": {
+                    col: float(np.mean(mask[:, idx])) for idx, col in enumerate(true_df.columns)
+                },
+            }
+        return {"nll": {"overall": nll_overall, "per_target": nll_per_target}, "coverage": coverage_summary}
+
+    payload["raw"] = _summarize(y_std)
+
+    if tau is not None:
+        scaled = y_std * float(tau)
+        scaled_summary = _summarize(scaled)
+        payload["tau_scaled"] = {"value": float(tau), **scaled_summary}
+
+    return payload
+
+
+def _calibrate_tau(
+    true_df: pd.DataFrame,
+    pred_df: pd.DataFrame,
+    std_df: Optional[pd.DataFrame],
+    coverage_levels: Sequence[float],
+) -> Optional[float]:
+    if std_df is None or std_df.empty:
+        return None
+
+    y_true = true_df.to_numpy(dtype=np.float64, copy=False)
+    y_pred = pred_df.to_numpy(dtype=np.float64, copy=False)
+    y_std = std_df.to_numpy(dtype=np.float64, copy=False)
+
+    valid_levels = [level for level in coverage_levels if 0.0 < level < 1.0]
+    if not valid_levels:
+        return None
+
+    def objective(tau_value: float) -> float:
+        std_scaled = y_std * tau_value
+        error = 0.0
+        for level in valid_levels:
+            mask = _coverage_mask(y_true, y_pred, std_scaled, level)
+            coverage = float(np.mean(mask))
+            error += (coverage - level) ** 2
+        return error
+
+    # Coarse-to-fine search on a log scale
+    search_grid = np.logspace(-1, 1, num=60)
+    best_tau = 1.0
+    best_error = float("inf")
+    for candidate in search_grid:
+        err = objective(candidate)
+        if err < best_error:
+            best_error = err
+            best_tau = candidate
+
+    fine_lower = max(best_tau * 0.25, 1e-3)
+    fine_upper = best_tau * 4.0
+    fine_grid = np.linspace(fine_lower, fine_upper, num=80)
+    for candidate in fine_grid:
+        if candidate <= 0.0:
+            continue
+        err = objective(candidate)
+        if err < best_error:
+            best_error = err
+            best_tau = candidate
+
+    return float(best_tau)
+
+
+def _write_uncertainty_metrics(
+    run_dir: Path,
+    split_name: str,
+    payload: Optional[Dict[str, object]],
+) -> None:
+    if payload is None:
+        return
+    target_path = run_dir / f"{split_name}_uncertainty.json"
+    with target_path.open("w") as handle:
+        json.dump(payload, handle, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # Main execution flow
 # ---------------------------------------------------------------------------
@@ -602,6 +881,10 @@ def _save_report(
 def main() -> None:
     cfg = _parse_args()
     _set_all_seeds(cfg.seed)
+
+    if cfg.early_stopping and cfg.val_ratio <= 0.0:
+        print("Early stopping requested but no validation split configured; disabling early stopping.")
+        cfg.early_stopping = False
 
     device = torch.device(cfg.device)
     root = cfg.experiment_root or _default_experiment_root()
@@ -693,7 +976,13 @@ def main() -> None:
         std_df=train_std_df if cfg.save_std else None,
         error_feature_names=cfg.error_feature_names,
     )
+    _write_uncertainty_metrics(
+        run_dir,
+        "train",
+        _build_uncertainty_summary(train_true_df, train_pred_df, train_std_df, cfg.coverage_levels),
+    )
 
+    tau_value: Optional[float] = None
     if val_inputs is not None and val_latent is not None:
         val_mean_latent, val_var_latent = _predict_components(components, val_inputs, batch_size=cfg.batch_size, device=device)
         val_input_df, val_true_df, val_pred_df, val_std_df = _prepare_split_frames(
@@ -712,6 +1001,26 @@ def main() -> None:
             std_df=val_std_df if cfg.save_std else None,
             error_feature_names=cfg.error_feature_names,
         )
+        tau_value = _calibrate_tau(val_true_df, val_pred_df, val_std_df, cfg.coverage_levels)
+        val_uncertainty = _build_uncertainty_summary(
+            val_true_df,
+            val_pred_df,
+            val_std_df,
+            cfg.coverage_levels,
+            tau=tau_value,
+        )
+        _write_uncertainty_metrics(run_dir, "val", val_uncertainty)
+        if tau_value is not None:
+            with (run_dir / "tau.json").open("w") as handle:
+                json.dump(
+                    {
+                        "value": float(tau_value),
+                        "source": "val",
+                        "coverage_levels": [float(level) for level in cfg.coverage_levels],
+                    },
+                    handle,
+                    indent=2,
+                )
 
     test_mean_latent, test_var_latent = _predict_components(components, test_inputs, batch_size=cfg.batch_size, device=device)
     test_input_df, test_true_df, test_pred_df, test_std_df = _prepare_split_frames(
@@ -729,6 +1038,17 @@ def main() -> None:
         test_pred_df,
         std_df=test_std_df if cfg.save_std else None,
         error_feature_names=cfg.error_feature_names,
+    )
+    _write_uncertainty_metrics(
+        run_dir,
+        "test",
+        _build_uncertainty_summary(
+            test_true_df,
+            test_pred_df,
+            test_std_df,
+            cfg.coverage_levels,
+            tau=tau_value,
+        ),
     )
 
     # Individual test CSVs
@@ -754,6 +1074,11 @@ def main() -> None:
                 pred_df,
                 std_df=std_df if cfg.save_std else None,
                 error_feature_names=cfg.error_feature_names,
+            )
+            _write_uncertainty_metrics(
+                run_dir,
+                split_name,
+                _build_uncertainty_summary(true_df, pred_df, std_df, cfg.coverage_levels, tau=tau_value),
             )
 
     print(f"Run artifacts saved to {run_dir}")
