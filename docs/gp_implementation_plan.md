@@ -282,10 +282,13 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
 
 - 测试
   - [x] 单元：列解析（`resolve_from_csvs` 正则/空/异常）
-  - [ ] 单元：PCA 逆映射精度
+  - [x] 单元：PCA 逆映射精度
+    - `tests/test_gp_pca.py::test_inverse_transform_recovers_input_when_full_rank`
   - [x] 单元：方差投影（`diag(W^T Var_Z W)`）
-  - [ ] 集成：`svgp_baseline.py` 全流程冒烟
-  - [ ] 推理：`infer.py` 输入/输出列对齐检查
+  - [x] 集成：`svgp_baseline.py` 全流程冒烟
+    - `tests/test_svgp_cli.py` 触发训练 CLI（2 epoch 小样本）并检查产物。
+  - [x] 推理：`infer.py` 输入/输出列对齐检查
+    - 同测试验证 `tau.json`、默认推理与 `--no-tau` 缩放一致。
 
 - 对比与报告
   - [ ] 与 NN/Tree 公平对比（统一列/增强/标准化）
