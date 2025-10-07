@@ -310,6 +310,9 @@ C 档（非线性更强）：DKL（Deep Kernel Learning）
   - [x] 任务协方差保存与可视化
   - [x] 对比实验与结论
     - `experiments/mt_icm/2025-09-30_20-57-50`（seed 42，icm_rank=8，m=512，batch=512）：test MAE 20.6、RMSE 72.3、R²≈0.817、MAPE≈45.5%，0.9 覆盖率 0.897（raw）。相较 NN（5.57 MAE）与 A 档 SVGP（3.37 MAE）仍明显偏弱，后续需在变分噪声、latent 维度/秩及学习率策略上继续调参。
+  - [x] 超参 sweep 支持：CLI 新增 `--icm-rank-grid/--pca-components-grid/--pca-variance-grid/--noise-init-grid`，自动汇总 `summary.json` 与 `sweeps/.../sweep_summary.csv`
+  - [x] 优化器与变分增强：加入 `--lr-lmc/--lr-variational/--natgrad-lr/--no-whiten`（natural grad 需保留白化），训练环路按组学习率+NGD；`summary.json` 记录 PCA 解释方差与小量纲指标
+  - [ ] Sweep 调参复现：运行 rank×PCA×noise 网格（含小量纲 MAPE 指标），目标逼近 A 档精度
 
 - C 档：DKL（第三阶段）
   - [ ] 实现 `src/models/gp/dkl.py`（小型 MLP + SVGP）

@@ -42,3 +42,20 @@
   3. 在 `Ry/Rx` 小量级输出上引入加权 loss / re-scaling，以抑制 MAPE 过高。
   4. 复现跑 GPU 版本以验证计算瓶颈与更大 batch/m 的可行性。
 - 该实验已满足 B 档原型落地与产物规范，可作为后续调优的基线。
+
+## 2025-10-03 更新：调参与指标工具
+- CLI 新增 sweep 入口，可一次性扫描 `--icm-rank-grid`、`--pca-components-grid`/`--pca-variance-grid`、`--noise-init-grid` 组合，产物位于 `experiments/mt_icm/sweeps/<ts_tag>/` 并汇总 `sweep_summary.csv`。
+- 训练循环支持分组学习率与自然梯度：`--lr-lmc`、`--lr-variational`、`--natgrad-lr`（需保持白化开启），以及 `--no-whiten` 切换变分白化。
+- `summary.json` 附带：
+  - 测试集整体 MAE/RMSE/MAPE、最优验证 RMSE；
+  - 小量纲指标（默认以 95 分位数 < 0.25 判定），用于跟踪 `Ry/Rx/D` 的相对误差；
+  - PCA 解释方差与重构误差，便于评估降维损失。
+- 使用示例：
+  ```bash
+  uv run python src/models/gp/mt_icm.py \
+    --icm-rank-grid 6,8,10 \
+    --noise-init-grid 5e-4,1e-3 \
+    --pca-variance-grid 0.97,0.985,0.99 \
+    --natgrad-lr 0.1 --lr-lmc 0.004 --lr-variational 0.003 \
+    --sweep-save-summary --sweep-tag icm_rank_pca_noise
+  ```

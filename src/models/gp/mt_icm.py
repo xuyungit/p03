@@ -7,11 +7,14 @@ import copy
 import json
 import random
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from itertools import product
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import gpytorch
 import numpy as np
+import pandas as pd
 import torch
 from torch.optim import lr_scheduler
 from torch.utils.data import DataLoader, TensorDataset
@@ -41,6 +44,7 @@ from models.gp.uncertainty import (
     calibrate_quantile_tau_map,
 )
 from models.utils import ColumnSpec
+from models.evaluation.metrics import Metrics
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +90,11 @@ class CLIConfig:
     icm_rank: int = 2
     noise_init: float = 1e-3
     jitter: float = 1e-6
+    lr_variational: Optional[float] = None
+    lr_lmc: Optional[float] = None
+    natgrad_lr: Optional[float] = None
+    natgrad_clip: Optional[float] = 1000.0
+    whiten: bool = True
 
     save_std: bool = True
     print_freq: int = 50
@@ -101,6 +110,19 @@ class CLIConfig:
 
     experiment_root: Optional[Path] = None
     error_feature_names: Optional[List[str]] = None
+
+    # Sweep controls
+    icm_rank_grid: Optional[List[int]] = None
+    pca_components_grid: Optional[List[int]] = None
+    pca_variance_grid: Optional[List[float]] = None
+    noise_init_grid: Optional[List[float]] = None
+    sweep_max_runs: Optional[int] = None
+    sweep_tag: Optional[str] = None
+    sweep_save_summary: bool = False
+
+    # Error analysis configuration
+    small_magnitude_threshold: float = 0.25
+    small_magnitude_reference: str = "p95"
 
 
 def _split_tokens(raw: Optional[str]) -> Optional[List[str]]:
@@ -119,6 +141,16 @@ def _split_float_tokens(raw: Optional[str]) -> Optional[List[float]]:
         return [float(tok) for tok in tokens]
     except ValueError as exc:  # pragma: no cover - defensive path
         raise SystemExit(f"Failed to parse float list from '{raw}': {exc}") from exc
+
+
+def _split_int_tokens(raw: Optional[str]) -> Optional[List[int]]:
+    tokens = _split_tokens(raw)
+    if tokens is None:
+        return None
+    try:
+        return [int(tok) for tok in tokens]
+    except ValueError as exc:  # pragma: no cover - defensive path
+        raise SystemExit(f"Failed to parse integer list from '{raw}': {exc}") from exc
 
 
 def _maybe_path_list(value: object) -> List[Path]:
@@ -165,6 +197,13 @@ def _parse_args() -> CLIConfig:
     parser.add_argument("--icm-rank", type=int, default=2)
     parser.add_argument("--noise-init", type=float, default=1e-3)
     parser.add_argument("--jitter", type=float, default=1e-6)
+    parser.add_argument("--lr-variational", type=float, default=None)
+    parser.add_argument("--lr-lmc", type=float, default=None)
+    parser.add_argument("--natgrad-lr", type=float, default=None)
+    parser.add_argument("--natgrad-clip", type=float, default=1000.0, help="Max L2 norm for natural gradient parameter updates (set <=0 to disable).")
+    parser.add_argument("--no-natgrad-clip", action="store_true")
+    parser.add_argument("--whiten", action="store_true")
+    parser.add_argument("--no-whiten", action="store_true")
 
     parser.add_argument("--save-std", action="store_true")
     parser.add_argument("--no-save-std", action="store_true")
@@ -193,6 +232,27 @@ def _parse_args() -> CLIConfig:
     parser.add_argument("--experiment-root", type=Path, default=None)
     parser.add_argument("--error-features", type=str, nargs="*", default=None)
 
+    parser.add_argument("--icm-rank-grid", type=str, default=None)
+    parser.add_argument("--pca-components-grid", type=str, default=None)
+    parser.add_argument("--pca-variance-grid", type=str, default=None)
+    parser.add_argument("--noise-init-grid", type=str, default=None)
+    parser.add_argument("--sweep-max-runs", type=int, default=None)
+    parser.add_argument("--sweep-tag", type=str, default=None)
+    parser.add_argument("--sweep-save-summary", action="store_true")
+    parser.add_argument(
+        "--small-magnitude-threshold",
+        type=float,
+        default=0.25,
+        help="Threshold (in original units) on the 95th percentile |y| to mark small-magnitude targets",
+    )
+    parser.add_argument(
+        "--small-magnitude-reference",
+        type=str,
+        choices=["mean_abs", "rms", "p95"],
+        default="p95",
+        help="Reference scale used when reporting relative MAE for small targets",
+    )
+
     args = parser.parse_args()
 
     augment_flip = True
@@ -206,6 +266,12 @@ def _parse_args() -> CLIConfig:
         ard = False
     elif args.ard:
         ard = True
+
+    whiten = True
+    if args.no_whiten:
+        whiten = False
+    elif args.whiten:
+        whiten = True
 
     save_std = True
     if args.no_save_std:
@@ -222,6 +288,30 @@ def _parse_args() -> CLIConfig:
     per_group_tau_config = args.per_group_tau_config
     if per_group_tau_mode == "config" and per_group_tau_config is None:
         raise SystemExit("per-group tau mode 'config' requires --per-group-tau-config")
+
+    icm_rank_grid = _split_int_tokens(args.icm_rank_grid)
+    pca_components_grid = _split_int_tokens(args.pca_components_grid)
+    pca_variance_grid = _split_float_tokens(args.pca_variance_grid)
+    noise_init_grid = _split_float_tokens(args.noise_init_grid)
+    if pca_components_grid and pca_variance_grid:
+        raise SystemExit("Use either --pca-components-grid or --pca-variance-grid, not both")
+
+    sweep_max_runs = args.sweep_max_runs
+    if sweep_max_runs is not None and sweep_max_runs <= 0:
+        raise SystemExit("--sweep-max-runs must be positive when provided")
+
+    small_threshold = float(args.small_magnitude_threshold)
+    if small_threshold < 0.0:
+        raise SystemExit("--small-magnitude-threshold must be non-negative")
+    if args.lr_variational is not None and args.lr_variational <= 0.0:
+        raise SystemExit("--lr-variational must be positive when provided")
+    if args.lr_lmc is not None and args.lr_lmc <= 0.0:
+        raise SystemExit("--lr-lmc must be positive when provided")
+    if args.natgrad_lr is not None and args.natgrad_lr <= 0.0:
+        raise SystemExit("--natgrad-lr must be positive when provided")
+    natgrad_clip = None if args.no_natgrad_clip else float(args.natgrad_clip)
+    if natgrad_clip is not None and natgrad_clip <= 0.0:
+        natgrad_clip = None
 
     cfg = CLIConfig(
         train_csv=args.train_csv,
@@ -255,6 +345,11 @@ def _parse_args() -> CLIConfig:
         icm_rank=max(1, args.icm_rank),
         noise_init=args.noise_init,
         jitter=args.jitter,
+        lr_variational=args.lr_variational,
+        lr_lmc=args.lr_lmc,
+        natgrad_lr=args.natgrad_lr,
+        natgrad_clip=natgrad_clip,
+        whiten=whiten,
         save_std=save_std,
         print_freq=max(1, args.print_freq),
         val_interval=max(1, args.val_interval),
@@ -267,9 +362,20 @@ def _parse_args() -> CLIConfig:
         pca_max_components=args.pca_max_components,
         experiment_root=args.experiment_root,
         error_feature_names=args.error_features,
+        icm_rank_grid=icm_rank_grid,
+        pca_components_grid=pca_components_grid,
+        pca_variance_grid=pca_variance_grid,
+        noise_init_grid=noise_init_grid,
+        sweep_max_runs=sweep_max_runs,
+        sweep_tag=args.sweep_tag,
+        sweep_save_summary=args.sweep_save_summary,
+        small_magnitude_threshold=small_threshold,
+        small_magnitude_reference=args.small_magnitude_reference.lower(),
     )
     if cfg.preset is not None:
         cfg = _apply_preset(cfg)
+    if not cfg.whiten and cfg.natgrad_lr:
+        raise SystemExit("Natural gradient updates require whitened variational parameters; remove --no-whiten or --natgrad-lr")
     return cfg
 
 
@@ -324,10 +430,20 @@ def _apply_preset(cfg: CLIConfig) -> CLIConfig:
         "icm_rank",
         "noise_init",
         "jitter",
+        "lr_variational",
+        "lr_lmc",
+        "natgrad_lr",
+        "natgrad_clip",
+        "whiten",
         "pca_enable",
         "pca_variance",
         "pca_components",
         "pca_max_components",
+        "sweep_max_runs",
+        "sweep_tag",
+        "sweep_save_summary",
+        "small_magnitude_threshold",
+        "small_magnitude_reference",
     ):
         if key in payload:
             setattr(updated, key, payload[key])
@@ -359,6 +475,25 @@ def _apply_preset(cfg: CLIConfig) -> CLIConfig:
         if not levels:
             raise SystemExit("coverage_levels in preset must not be empty")
         updated.coverage_levels = [lvl for lvl in levels if 0.0 < lvl < 1.0]
+    for key, splitter, caster in (
+        ("icm_rank_grid", _split_int_tokens, int),
+        ("pca_components_grid", _split_int_tokens, int),
+        ("pca_variance_grid", _split_float_tokens, float),
+        ("noise_init_grid", _split_float_tokens, float),
+    ):
+        if key in payload:
+            raw_value = payload[key]
+            if raw_value is None:
+                setattr(updated, key, None)
+                continue
+            if isinstance(raw_value, str):
+                values = splitter(raw_value)
+            else:
+                try:
+                    values = [caster(item) for item in raw_value]
+                except Exception as exc:  # pragma: no cover - invalid preset values
+                    raise SystemExit(f"Invalid value list for '{key}': {raw_value}") from exc
+            setattr(updated, key, values)
     if "per_group_tau_mode" in payload:
         updated.per_group_tau_mode = str(payload["per_group_tau_mode"]).lower()
     if (
@@ -371,6 +506,11 @@ def _apply_preset(cfg: CLIConfig) -> CLIConfig:
         updated.experiment_root = Path(payload["experiment_root"])
     if updated.error_feature_names is None and payload.get("error_feature_names"):
         updated.error_feature_names = [str(x) for x in payload["error_feature_names"]]
+    updated.small_magnitude_reference = str(updated.small_magnitude_reference).lower()
+    if not updated.whiten and updated.natgrad_lr:
+        raise SystemExit(
+            "Preset requests natural gradient with --no-whiten; natural gradient requires whitened variational strategy"
+        )
 
     return updated
 
@@ -411,6 +551,7 @@ class MultitaskICMSVGP(gpytorch.models.ApproximateGP):
         ard: bool,
         icm_rank: int,
         jitter: float,
+        whiten: bool,
     ) -> None:
         num_tasks = int(num_tasks)
         num_latents = max(1, int(icm_rank))
@@ -418,12 +559,20 @@ class MultitaskICMSVGP(gpytorch.models.ApproximateGP):
             inducing_points.size(-2),
             batch_shape=torch.Size([num_latents]),
         )
-        base_strategy = gpytorch.variational.VariationalStrategy(
-            self,
-            inducing_points,
-            variational_distribution,
-            learn_inducing_locations=True,
-        )
+        if whiten:
+            base_strategy = gpytorch.variational.VariationalStrategy(
+                self,
+                inducing_points,
+                variational_distribution,
+                learn_inducing_locations=True,
+            )
+        else:
+            base_strategy = gpytorch.variational.UnwhitenedVariationalStrategy(
+                self,
+                inducing_points,
+                variational_distribution,
+                learn_inducing_locations=True,
+            )
         variational_strategy = gpytorch.variational.LMCVariationalStrategy(
             base_strategy,
             num_tasks=num_tasks,
@@ -444,6 +593,7 @@ class MultitaskICMSVGP(gpytorch.models.ApproximateGP):
         self._manual_jitter = float(jitter)
         self.num_tasks = num_tasks
         self.num_latents = num_latents
+        self._whiten = bool(whiten)
 
     def forward(self, x: torch.Tensor) -> gpytorch.distributions.MultivariateNormal:
         mean_x = self.mean_module(x)
@@ -517,6 +667,7 @@ def _train_model(
         ard=cfg.ard,
         icm_rank=cfg.icm_rank,
         jitter=cfg.jitter,
+        whiten=cfg.whiten,
     )
     likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=num_tasks)
     likelihood.initialize(noise=cfg.noise_init)
@@ -530,10 +681,44 @@ def _train_model(
         val_loader = _make_loader(val_inputs, val_targets, batch_size=cfg.batch_size, shuffle=False)
 
     num_data = train_loader.dataset.tensors[0].shape[0]
-    optimizer = torch.optim.Adam([
-        {"params": model.parameters()},
-        {"params": likelihood.parameters()},
-    ], lr=cfg.lr)
+    variational_params = [p for p in model.variational_parameters() if p.requires_grad]
+    hyperparams: List[torch.nn.Parameter] = []
+    lmc_params: List[torch.nn.Parameter] = []
+    for name, param in model.named_hyperparameters():
+        if not param.requires_grad:
+            continue
+        if "lmc_coefficients" in name:
+            lmc_params.append(param)
+        else:
+            hyperparams.append(param)
+    likelihood_params = [p for p in likelihood.parameters() if p.requires_grad]
+
+    optimizer_groups: List[Dict[str, object]] = []
+    base_lr = float(cfg.lr)
+    if hyperparams:
+        optimizer_groups.append({"params": hyperparams, "lr": base_lr})
+    if lmc_params:
+        lmc_lr = float(cfg.lr_lmc) if cfg.lr_lmc is not None else base_lr
+        optimizer_groups.append({"params": lmc_params, "lr": lmc_lr})
+    if likelihood_params:
+        optimizer_groups.append({"params": likelihood_params, "lr": base_lr})
+
+    use_natgrad = bool(cfg.natgrad_lr)
+    natgrad_optimizer: Optional[gpytorch.optim.NGD] = None
+    if use_natgrad and variational_params:
+        natgrad_optimizer = gpytorch.optim.NGD(
+            variational_params,
+            num_data=num_data,
+            lr=float(cfg.natgrad_lr),
+        )
+    elif variational_params:
+        var_lr = float(cfg.lr_variational) if cfg.lr_variational is not None else base_lr
+        optimizer_groups.append({"params": variational_params, "lr": var_lr})
+
+    if not optimizer_groups:
+        raise RuntimeError("No trainable parameter groups configured for Adam optimizer")
+
+    optimizer = torch.optim.Adam(optimizer_groups, lr=base_lr)
     mll = gpytorch.mlls.VariationalELBO(likelihood, model, num_data=num_data)
     scheduler = _build_scheduler(cfg, optimizer)
 
@@ -564,10 +749,16 @@ def _train_model(
             yb = yb.to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            with gpytorch.settings.cholesky_jitter(model.extra_jitter()):
-                output = model(xb)
-                loss = -mll(output, yb)
-            loss.backward()
+            if natgrad_optimizer is not None:
+                natgrad_optimizer.zero_grad()
+        with gpytorch.settings.cholesky_jitter(model.extra_jitter()):
+            output = model(xb)
+            loss = -mll(output, yb)
+        loss.backward()
+        if natgrad_optimizer is not None:
+            if cfg.natgrad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(variational_params, float(cfg.natgrad_clip))
+            natgrad_optimizer.step()
             optimizer.step()
 
             running_loss += loss.item()
@@ -610,6 +801,7 @@ def _train_model(
                 "val_rmse": float(val_rmse) if val_rmse is not None else float("nan"),
                 "prewarm": 1.0 if epoch <= prewarm_epochs else 0.0,
                 "lr": float(current_lr),
+                "natgrad": 1.0 if natgrad_optimizer is not None else 0.0,
             }
         )
 
@@ -732,12 +924,112 @@ def _save_task_covariance(
 
 
 # ---------------------------------------------------------------------------
+# Metrics aggregation helpers
+# ---------------------------------------------------------------------------
+
+
+def _safe_nanmean(values: Iterable[float]) -> float:
+    array = np.asarray(list(values), dtype=float)
+    if array.size == 0:
+        return float("nan")
+    mask = ~np.isnan(array)
+    if not mask.any():
+        return float("nan")
+    return float(np.mean(array[mask]))
+
+
+def _compute_small_magnitude_summary(
+    true_df: pd.DataFrame,
+    pred_df: pd.DataFrame,
+    *,
+    threshold: float,
+    reference: str,
+    group_mapping: Optional[TargetGroupMapping],
+) -> Dict[str, object]:
+    true_df = true_df.copy()
+    pred_df = pred_df.copy()
+
+    quantile_scale = true_df.abs().quantile(0.95)
+    quantile_scale = quantile_scale.astype(float)
+    small_columns = [col for col, value in quantile_scale.items() if value <= threshold]
+
+    mae = Metrics.mean_absolute_error(true_df, pred_df)
+    mae_by_col = {k: float(v) for k, v in mae.items() if k != "overall"}
+    rmse = Metrics.root_mean_squared_error(true_df, pred_df)
+    rmse_by_col = {k: float(v) for k, v in rmse.items() if k != "overall"}
+    mape = Metrics.mean_absolute_percentage_error(true_df, pred_df)
+    mape_by_col = {k: float(v) for k, v in mape.items() if k != "overall"}
+    rel_mae = Metrics.mean_absolute_error_percent(true_df, pred_df, denom=reference)
+    rel_mae_by_col = {k: float(v) for k, v in rel_mae.items() if k != "overall"}
+
+    small_metrics = {
+        "count": len(small_columns),
+        "mae": _safe_nanmean(mae_by_col.get(col) for col in small_columns),
+        "rmse": _safe_nanmean(rmse_by_col.get(col) for col in small_columns),
+        "mape": _safe_nanmean(mape_by_col.get(col) for col in small_columns),
+        "relative_mae_percent": _safe_nanmean(rel_mae_by_col.get(col) for col in small_columns),
+        "scale_p95_mean": _safe_nanmean(quantile_scale[col] for col in small_columns),
+    }
+
+    group_metrics: Dict[str, Dict[str, float]] = {}
+    if group_mapping is not None:
+        for group, columns in group_mapping.group_to_columns.items():
+            relevant = [col for col in columns if col in mae_by_col]
+            if not relevant:
+                continue
+            group_metrics[group] = {
+                "count": len(relevant),
+                "mae": _safe_nanmean(mae_by_col.get(col) for col in relevant),
+                "rmse": _safe_nanmean(rmse_by_col.get(col) for col in relevant),
+                "mape": _safe_nanmean(mape_by_col.get(col) for col in relevant),
+                "relative_mae_percent": _safe_nanmean(rel_mae_by_col.get(col) for col in relevant),
+                "scale_p95_mean": _safe_nanmean(quantile_scale[col] for col in relevant),
+                "mean_abs_true": _safe_nanmean(true_df[col].abs().mean() for col in relevant),
+            }
+
+    return {
+        "threshold": float(threshold),
+        "reference": reference,
+        "small_columns": small_columns,
+        "quantile_p95": {col: float(val) for col, val in quantile_scale.items()},
+        "summary": small_metrics,
+        "groups": group_metrics,
+    }
+
+
+@dataclass
+class RunSummary:
+    run_dir: Path
+    variant: Dict[str, object]
+    overall: Dict[str, float]
+    small: Dict[str, object]
+    group_metrics: Dict[str, Dict[str, float]]
+    best_val_rmse: Optional[float]
+
+    def as_table_row(self) -> Dict[str, object]:
+        row: Dict[str, object] = {**self.variant}
+        row["run_dir"] = str(self.run_dir)
+        row["best_val_rmse"] = self.best_val_rmse
+        row.update({f"test_{k}": v for k, v in self.overall.items()})
+        small_summary = self.small.get("summary") if isinstance(self.small, dict) else None
+        if isinstance(small_summary, dict):
+            for key in ("count", "mae", "rmse", "mape", "relative_mae_percent"):
+                if key in small_summary:
+                    row[f"small_{key}"] = small_summary[key]
+        small_columns = self.small.get("small_columns") if isinstance(self.small, dict) else None
+        if isinstance(small_columns, list):
+            row["small_columns"] = ",".join(small_columns)
+        for group, metrics in sorted(self.group_metrics.items()):
+            prefix = f"group_{group}"
+            for key, value in metrics.items():
+                row[f"{prefix}_{key}"] = value
+        return row
+# ---------------------------------------------------------------------------
 # Main execution flow
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    cfg = _parse_args()
+def execute_run(cfg: CLIConfig) -> RunSummary:
     _set_all_seeds(cfg.seed)
 
     if cfg.early_stopping and cfg.val_ratio <= 0.0:
@@ -943,12 +1235,12 @@ def main() -> None:
                     handle,
                     indent=2,
                 )
-        if per_group_tau:
-            with (run_dir / "per_group_tau.json").open("w") as handle:
-                json.dump(
-                    {
-                        "values": {k: float(v) for k, v in per_group_tau.items()},
-                        "source": "val",
+    if per_group_tau:
+        with (run_dir / "per_group_tau.json").open("w") as handle:
+            json.dump(
+                {
+                    "values": {k: float(v) for k, v in per_group_tau.items()},
+                    "source": "val",
                         "coverage_levels": [float(level) for level in cfg.coverage_levels],
                         "groups": group_mapping.to_serializable() if group_mapping is not None else {},
                         "mode": cfg.per_group_tau_mode,
@@ -1054,7 +1346,193 @@ def main() -> None:
                 ),
             )
 
+    metrics_full = Metrics.compute_all_metrics(test_true_df.copy(), test_pred_df.copy())
+    overall_metrics = {
+        "mae": float(metrics_full["mae"].get("overall", float("nan"))),
+        "rmse": float(metrics_full["rmse"].get("overall", float("nan"))),
+        "mape": float(metrics_full["mape"].get("overall", float("nan"))),
+        "r2": float(metrics_full["r2"].get("overall", float("nan"))),
+    }
+
+    small_summary = _compute_small_magnitude_summary(
+        test_true_df,
+        test_pred_df,
+        threshold=cfg.small_magnitude_threshold,
+        reference=cfg.small_magnitude_reference,
+        group_mapping=group_mapping,
+    )
+
+    best_val_rmse: Optional[float] = None
+    if history_rows:
+        val_vals = [row.get("val_rmse") for row in history_rows]
+        val_clean = [float(v) for v in val_vals if v is not None and not np.isnan(v)]
+        if val_clean:
+            best_val_rmse = float(np.min(val_clean))
+
+    pca_summary: Optional[Dict[str, object]] = None
+    if data_module.pca is not None:
+        explained = data_module.pca.explained_variance_ratio_.tolist()
+        cumulative = float(np.sum(data_module.pca.explained_variance_ratio_))
+        recon = data_module.pca.inverse_transform(data_module._train_targets_encoded)
+        diff = recon - data_module._train_targets_std
+        recon_rmse = float(np.sqrt(np.mean(np.square(diff))))
+        recon_mae = float(np.mean(np.abs(diff)))
+        pca_summary = {
+            "components": data_module.target_latent_dim,
+            "explained_variance_ratio": explained,
+            "explained_variance_cum": cumulative,
+            "reconstruction_rmse": recon_rmse,
+            "reconstruction_mae": recon_mae,
+        }
+
+    variant = {
+        "icm_rank": cfg.icm_rank,
+        "latent_dim": data_module.target_latent_dim,
+        "pca_enabled": cfg.pca_enable,
+        "pca_variance_target": cfg.pca_variance,
+        "pca_components_requested": cfg.pca_components,
+        "noise_init": cfg.noise_init,
+        "inducing": cfg.inducing,
+        "batch_size": cfg.batch_size,
+        "epochs": cfg.epochs,
+        "prewarm_epochs": cfg.prewarm_epochs,
+        "lr": cfg.lr,
+        "lr_variational": cfg.lr_variational,
+        "lr_lmc": cfg.lr_lmc,
+        "natgrad_lr": cfg.natgrad_lr,
+        "whiten": cfg.whiten,
+        "seed": cfg.seed,
+        "small_magnitude_threshold": cfg.small_magnitude_threshold,
+        "small_magnitude_reference": cfg.small_magnitude_reference,
+        "device": cfg.device,
+    }
+
+    summary_payload = {
+        "variant": variant,
+        "overall": overall_metrics,
+        "small_magnitude": small_summary,
+        "best_val_rmse": best_val_rmse,
+        "run_dir": str(run_dir),
+        "pca": pca_summary,
+    }
+    with (run_dir / "summary.json").open("w") as handle:
+        json.dump(summary_payload, handle, indent=2)
+
     print(f"Run artifacts saved to {run_dir}")
+
+    return RunSummary(
+        run_dir=run_dir,
+        variant=variant,
+        overall=overall_metrics,
+        small=small_summary,
+        group_metrics=small_summary.get("groups", {}) if isinstance(small_summary, dict) else {},
+        best_val_rmse=best_val_rmse,
+    )
+
+
+def _run_sweep(cfg: CLIConfig) -> None:
+    base_root = cfg.experiment_root or default_experiment_root(__file__)
+    sweep_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if cfg.sweep_tag:
+        safe_tag = str(cfg.sweep_tag).strip().replace(" ", "_")
+        if safe_tag:
+            sweep_id = f"{sweep_id}_{safe_tag}"
+    sweep_root = base_root / "sweeps" / sweep_id
+    sweep_root.mkdir(parents=True, exist_ok=True)
+
+    icm_values = sorted(set(cfg.icm_rank_grid or [cfg.icm_rank]))
+    noise_values = sorted(set(cfg.noise_init_grid or [cfg.noise_init]))
+    if cfg.pca_components_grid:
+        pca_axis = [("components", int(val)) for val in sorted(set(cfg.pca_components_grid))]
+    elif cfg.pca_variance_grid:
+        pca_axis = [("variance", float(val)) for val in sorted(set(cfg.pca_variance_grid))]
+    else:
+        pca_axis = [("base", None)]
+
+    summaries: List[RunSummary] = []
+    total_runs = 0
+    stop_requested = False
+
+    for icm_rank in icm_values:
+        if stop_requested:
+            break
+        for noise_init in noise_values:
+            if stop_requested:
+                break
+            for pca_mode, pca_value in pca_axis:
+                run_cfg = dataclass_replace(cfg)
+                run_cfg.icm_rank = int(icm_rank)
+                run_cfg.noise_init = float(noise_init)
+                if pca_mode == "components":
+                    run_cfg.pca_components = int(pca_value)
+                    run_cfg.pca_variance = cfg.pca_variance
+                elif pca_mode == "variance":
+                    run_cfg.pca_components = None
+                    run_cfg.pca_variance = float(pca_value)
+                else:
+                    run_cfg.pca_components = cfg.pca_components
+                    run_cfg.pca_variance = cfg.pca_variance
+                run_cfg.icm_rank_grid = None
+                run_cfg.pca_components_grid = None
+                run_cfg.pca_variance_grid = None
+                run_cfg.noise_init_grid = None
+                run_cfg.sweep_max_runs = None
+                run_cfg.experiment_root = sweep_root
+                run_cfg.sweep_tag = cfg.sweep_tag
+                run_cfg.sweep_save_summary = cfg.sweep_save_summary
+
+                summary = execute_run(run_cfg)
+                summaries.append(summary)
+                total_runs += 1
+
+                if cfg.sweep_max_runs and total_runs >= cfg.sweep_max_runs:
+                    stop_requested = True
+                    break
+
+    if not summaries:
+        print("Sweep completed with no runs executed.")
+        return
+
+    rows = [summary.as_table_row() for summary in summaries]
+    df = pd.DataFrame(rows)
+    if "small_mape" in df.columns and "test_mae" in df.columns:
+        df.sort_values(by=["small_mape", "test_mae"], inplace=True, na_position="last")
+    elif "test_mae" in df.columns:
+        df.sort_values(by=["test_mae"], inplace=True, na_position="last")
+
+    best_row = df.iloc[0].to_dict()
+    print("Sweep completed. Best configuration (prioritising small_mape then test_mae):")
+    for key in (
+        "icm_rank",
+        "latent_dim",
+        "noise_init",
+        "pca_components_requested",
+        "pca_variance_target",
+        "small_mape",
+        "test_mae",
+        "test_rmse",
+    ):
+        if key in best_row:
+            print(f"  {key}: {best_row[key]}")
+    print(f"  run_dir: {best_row.get('run_dir')}")
+
+    if cfg.sweep_save_summary:
+        df.to_csv(sweep_root / "sweep_summary.csv", index=False)
+        df.to_json(sweep_root / "sweep_summary.json", orient="records", indent=2)
+
+
+def main() -> None:
+    cfg = _parse_args()
+    sweep_values = [
+        cfg.icm_rank_grid,
+        cfg.pca_components_grid,
+        cfg.pca_variance_grid,
+        cfg.noise_init_grid,
+    ]
+    if any(values for values in sweep_values):
+        _run_sweep(cfg)
+    else:
+        execute_run(cfg)
 
 
 if __name__ == "__main__":
