@@ -10,6 +10,7 @@ Additional optimizations over fit_multi_case_optimized.py:
 Expected performance improvement: 1.5-2x over fit_multi_case_optimized.py
 
 Usage:
+    # Basic usage (默认固定 settlement_a = 0.0 作为参考点)
     uv run python src/models/fit_multi_case_v2.py \
         --data data/augmented/dt_24hours_data_4.csv \
         --max-samples 100 \
@@ -19,6 +20,18 @@ Usage:
     uv run python src/models/fit_multi_case_v2.py \
         --data data/augmented/dt_24hours_data_new.csv \
         --data data/augmented/dt_24hours_data_new2.csv \
+        --maxiter 500
+    
+    # Fixed KV factors (not fitted, use given values)
+    uv run python src/models/fit_multi_case_v2.py \
+        --data data/augmented/dt_24hours_data_4.csv \
+        --fixed-kv 1.0 1.0 1.0 1.0 \
+        --maxiter 500
+    
+    # 不固定第一个沉降（拟合全部4个沉降）
+    uv run python src/models/fit_multi_case_v2.py \
+        --data data/augmented/dt_24hours_data_4.csv \
+        --no-fix-first-settlement \
         --maxiter 500
 """
 
@@ -187,6 +200,8 @@ class VectorizedMultiCaseFitter:
         ne_per_span: int = 64,
         temp_spatial_weight: float = 1.0,
         temp_temporal_weight: float = 1.0,
+        fixed_kv_factors: tuple[float, float, float, float] | None = None,
+        fix_first_settlement: bool = True,
     ):
         """
         Args:
@@ -195,6 +210,8 @@ class VectorizedMultiCaseFitter:
             ne_per_span: Number of elements per span
             temp_spatial_weight: Weight for spatial temperature smoothness
             temp_temporal_weight: Weight for temporal temperature smoothness
+            fixed_kv_factors: If provided, use these fixed KV values instead of fitting
+            fix_first_settlement: If True, fix settlement_a to 0.0 as reference (default: True)
         """
         self.reactions_matrix = reactions_matrix
         self.n_cases = reactions_matrix.shape[0]
@@ -202,6 +219,8 @@ class VectorizedMultiCaseFitter:
         self.ne_per_span = ne_per_span
         self.temp_spatial_weight = temp_spatial_weight
         self.temp_temporal_weight = temp_temporal_weight
+        self.fixed_kv_factors = fixed_kv_factors
+        self.fix_first_settlement = fix_first_settlement
         
         # Cache
         self._cached_system: StructuralSystem | None = None
@@ -215,10 +234,14 @@ class VectorizedMultiCaseFitter:
         self._n_residual_calls = 0
         self._n_system_assemblies = 0
         
+        kv_status = f"固定为 {fixed_kv_factors}" if fixed_kv_factors else "参与拟合"
+        settlement_status = "Settlement_A 固定为 0.0（参考点）" if fix_first_settlement else "全部拟合"
         print(f"\n多工况拟合设置 (向量化版本 v2):")
         print(f"  工况数量: {self.n_cases}")
         print(f"  每工况约束: 4 (反力)")
         print(f"  总约束数: {self.n_cases * 4}")
+        print(f"  KV参数: {kv_status}")
+        print(f"  沉降参数: {settlement_status}")
         print(f"  优化特性: 批量求解 + 向量化温度载荷")
     
     def _build_x0_and_bounds(
@@ -231,20 +254,28 @@ class VectorizedMultiCaseFitter:
         upper_list = []
         
         if fit_struct:
-            # Settlements (4)
-            x0_list.extend([0.0, 0.0, 0.0, 0.0])
-            lower_list.extend([-20.0] * 4)
-            upper_list.extend([20.0] * 4)
+            # Settlements (4 or 3 if first is fixed)
+            if self.fix_first_settlement:
+                # Only optimize settlements B, C, D (A is fixed at 0.0)
+                x0_list.extend([0.0, 0.0, 0.0])
+                lower_list.extend([-20.0] * 3)
+                upper_list.extend([20.0] * 3)
+            else:
+                # Optimize all 4 settlements
+                x0_list.extend([0.0, 0.0, 0.0, 0.0])
+                lower_list.extend([-20.0] * 4)
+                upper_list.extend([20.0] * 4)
             
             # EI factors (3)
             x0_list.extend([1.0, 1.0, 1.0])
             lower_list.extend([0.1] * 3)
             upper_list.extend([2.0] * 3)
             
-            # Kv factors (4)
-            x0_list.extend([1.0, 1.0, 1.0, 1.0])
-            lower_list.extend([0.1] * 4)
-            upper_list.extend([3.0] * 4)
+            # Kv factors (4) - only if not fixed
+            if self.fixed_kv_factors is None:
+                x0_list.extend([1.0, 1.0, 1.0, 1.0])
+                lower_list.extend([0.1] * 4)
+                upper_list.extend([3.0] * 4)
         
         # Temperature gradients (3 per case)
         for _ in range(self.n_cases):
@@ -256,11 +287,15 @@ class VectorizedMultiCaseFitter:
         lower = np.array(lower_list)
         upper = np.array(upper_list)
         
-        n_struct = 11 if fit_struct else 0
+        # Count parameters
+        n_settlement = (3 if self.fix_first_settlement else 4) if fit_struct else 0
+        n_ei = 3 if fit_struct else 0
+        n_kv = 0 if (not fit_struct or self.fixed_kv_factors is not None) else 4
+        n_struct = n_settlement + n_ei + n_kv
         n_temp = self.n_cases * 3
         
         print(f"\n参数空间:")
-        print(f"  结构参数: {n_struct}")
+        print(f"  结构参数: {n_struct} (沉降: {n_settlement}, EI: {n_ei}, KV: {n_kv})")
         print(f"  温度参数: {n_temp} ({self.n_cases} × 3)")
         print(f"  总参数数: {len(x0)}")
         
@@ -280,16 +315,27 @@ class VectorizedMultiCaseFitter:
         idx = 0
         
         if fit_struct:
-            settlements = tuple(x[idx:idx+4])
-            idx += 4
+            # Settlements: either (B, C, D) with A=0.0, or (A, B, C, D)
+            if self.fix_first_settlement:
+                settlements = (0.0, x[idx], x[idx+1], x[idx+2])
+                idx += 3
+            else:
+                settlements = tuple(x[idx:idx+4])
+                idx += 4
+            
             ei_factors = tuple(x[idx:idx+3])
             idx += 3
-            kv_factors = tuple(x[idx:idx+4])
-            idx += 4
+            
+            # Use fixed KV if provided, otherwise extract from optimization variables
+            if self.fixed_kv_factors is not None:
+                kv_factors = self.fixed_kv_factors
+            else:
+                kv_factors = tuple(x[idx:idx+4])
+                idx += 4
         else:
             settlements = (0.0, 0.0, 0.0, 0.0)
             ei_factors = (1.0, 1.0, 1.0)
-            kv_factors = (1.0, 1.0, 1.0, 1.0)
+            kv_factors = self.fixed_kv_factors if self.fixed_kv_factors is not None else (1.0, 1.0, 1.0, 1.0)
         
         struct_params = StructuralParams(
             settlements=settlements,  # type: ignore[arg-type]
@@ -450,6 +496,10 @@ def main():
     parser.add_argument('--maxiter', type=int, default=200, help='最大迭代次数')
     parser.add_argument('--temp-spatial-weight', type=float, default=1.0)
     parser.add_argument('--temp-temporal-weight', type=float, default=1.0)
+    parser.add_argument('--fixed-kv', type=float, nargs=4, metavar=('KVA', 'KVB', 'KVC', 'KVD'),
+                        help='固定KV参数 (4个值: kv_a kv_b kv_c kv_d)，不参与拟合')
+    parser.add_argument('--no-fix-first-settlement', action='store_true',
+                        help='不固定第一个沉降为0（默认固定settlement_a=0作为参考点）')
     parser.add_argument('--output', type=Path, help='输出CSV文件')
     
     args = parser.parse_args()
@@ -464,12 +514,23 @@ def main():
     true_temps = df[['dT_s1_C', 'dT_s2_C', 'dT_s3_C']].to_numpy()
     uniform_load = float(df['uniform_load_N_per_mm'].iloc[0])
     
+    # Parse fixed KV if provided
+    fixed_kv_factors = None
+    if args.fixed_kv is not None:
+        fixed_kv_factors = tuple(args.fixed_kv)
+        print(f"\n使用固定KV参数: {fixed_kv_factors}")
+    
+    # Determine if first settlement should be fixed
+    fix_first_settlement = not args.no_fix_first_settlement
+    
     # Create fitter
     fitter = VectorizedMultiCaseFitter(
         reactions_matrix=reactions_matrix,
         uniform_load=uniform_load,
         temp_spatial_weight=args.temp_spatial_weight,
         temp_temporal_weight=args.temp_temporal_weight,
+        fixed_kv_factors=fixed_kv_factors,
+        fix_first_settlement=fix_first_settlement,
     )
     
     # Fit
@@ -554,9 +615,59 @@ def main():
         print(f"    真实: [{true_dT[0]:6.2f}, {true_dT[1]:6.2f}, {true_dT[2]:6.2f}]°C")
         print(f"    拟合: [{fitted_dT[0]:6.2f}, {fitted_dT[1]:6.2f}, {fitted_dT[2]:6.2f}]°C")
     
+    # Forward verification: recompute reactions using fitted parameters
+    print(f"\n{'='*60}")
+    print("正模型验算 - 使用拟合参数重新计算反力")
+    print(f"{'='*60}")
+    
+    # Assemble system with fitted structural parameters
+    fitted_system = assemble_structural_system(result['struct_params'])
+    
+    # Extract fitted temperature matrix
+    fitted_dT_matrix = np.array([ts.dT_spans for ts in result['thermal_states']])
+    
+    # Recompute reactions using forward model
+    _, recomputed_reactions = batch_solve_with_system(fitted_system, fitted_dT_matrix)
+    
+    # Compare with observed reactions
+    forward_residuals = recomputed_reactions - reactions_matrix
+    
+    print(f"\n正模型验算残差统计:")
+    print(f"  RMSE: {np.sqrt(np.mean(forward_residuals**2)):.6e} kN")
+    print(f"  最大残差: {np.max(np.abs(forward_residuals)):.6e} kN")
+    print(f"  平均残差: {np.mean(np.abs(forward_residuals)):.6e} kN")
+    
+    # Compare optimizer residuals vs forward residuals
+    optimizer_rmse = np.sqrt(np.mean(residuals**2))
+    forward_rmse = np.sqrt(np.mean(forward_residuals**2))
+    
+    print(f"\n残差对比:")
+    print(f"  优化器残差 RMSE: {optimizer_rmse:.6e} kN")
+    print(f"  正模型残差 RMSE: {forward_rmse:.6e} kN")
+    print(f"  差异: {abs(optimizer_rmse - forward_rmse):.6e} kN")
+    
+    if abs(optimizer_rmse - forward_rmse) > 1e-6:
+        print(f"  ⚠️  警告: 优化器残差与正模型残差存在显著差异，可能存在数值问题")
+    else:
+        print(f"  ✓ 优化器残差与正模型残差一致，验算通过")
+    
+    # Show detailed comparison for first few cases
+    print(f"\n前5个工况的详细对比:")
+    print(f"  {'Case':<6} {'Support':<8} {'Observed':>12} {'Recomputed':>12} {'Residual':>12}")
+    print(f"  {'-'*60}")
+    support_names = ['A', 'B', 'C', 'D']
+    for i in range(min(5, len(reactions_matrix))):
+        for j, name in enumerate(support_names):
+            obs = reactions_matrix[i, j]
+            rec = recomputed_reactions[i, j]
+            res = forward_residuals[i, j]
+            print(f"  {i:<6} {name:<8} {obs:>12.6f} {rec:>12.6f} {res:>12.6e}")
+    
     # Save results
     if args.output:
         output_df = df.copy()
+        
+        # Fitted structural parameters
         output_df['settlement_a_fitted'] = sp.settlements[0]
         output_df['settlement_b_fitted'] = sp.settlements[1]
         output_df['settlement_c_fitted'] = sp.settlements[2]
@@ -569,16 +680,33 @@ def main():
         output_df['kv_factor_c_fitted'] = sp.kv_factors[2]
         output_df['kv_factor_d_fitted'] = sp.kv_factors[3]
         
+        # Fitted temperatures
         for i, ts in enumerate(result['thermal_states']):
             output_df.loc[i, 'dT_s1_fitted'] = ts.dT_spans[0]
             output_df.loc[i, 'dT_s2_fitted'] = ts.dT_spans[1]
             output_df.loc[i, 'dT_s3_fitted'] = ts.dT_spans[2]
         
+        # Optimizer residuals (from optimization process)
         for i in range(4):
-            output_df[f'residual_R{i+1}'] = residuals[:, i]
+            output_df[f'residual_optimizer_R{i+1}'] = residuals[:, i]
+        
+        # Forward model verification: recomputed reactions
+        support_names = ['a', 'b', 'c', 'd']
+        for i, name in enumerate(support_names):
+            output_df[f'R_{name}_recomputed_kN'] = recomputed_reactions[:, i]
+        
+        # Forward model residuals (observed - recomputed)
+        for i in range(4):
+            output_df[f'residual_forward_R{i+1}'] = forward_residuals[:, i]
         
         output_df.to_csv(args.output, index=False)
         print(f"\n结果已保存到: {args.output}")
+        print(f"\n输出文件包含:")
+        print(f"  - 拟合的结构参数 (11个)")
+        print(f"  - 拟合的温度参数 (每工况3个)")
+        print(f"  - 优化器残差 (4个反力残差)")
+        print(f"  - 正模型重算的反力 (4个)")
+        print(f"  - 正模型残差 (4个，用于验证多解)")
 
 
 if __name__ == '__main__':

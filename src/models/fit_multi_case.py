@@ -203,43 +203,36 @@ class MultiCaseFitter:
         physics_residuals = np.concatenate(physics_residuals)
         
         # 2. Temperature spatial smoothness regularization
-        # Constraint: adjacent spans within same case should have similar temperatures
-        # |dT[i, j+1] - dT[i, j]| should be small (< 5°C)
-        spatial_penalties = []
+        # Always return fixed-size array for scipy.optimize.least_squares
+        # Use soft penalty instead of conditional penalty
+        spatial_residuals = []
         if self.temp_spatial_weight > 0:
             for i in range(self.n_cases):
                 dT = np.array(thermal_states[i].dT_spans)
-                # Penalize large differences between adjacent spans
-                # Using soft constraint: penalize deviations beyond ±5°C
-                for j in range(2):  # spans 0-1 and 1-2
+                for j in range(2):  # 2 adjacent pairs per case
                     diff = dT[j+1] - dT[j]
-                    # Smooth penalty that increases beyond ±5°C
-                    if abs(diff) > 5.0:
-                        penalty = (abs(diff) - 5.0) * self.temp_spatial_weight
-                        spatial_penalties.append(penalty)
+                    # Soft L1 penalty: only penalize beyond threshold
+                    penalty = max(0.0, abs(diff) - 5.0) * self.temp_spatial_weight
+                    spatial_residuals.append(penalty)
         
         # 3. Temperature temporal smoothness regularization
-        # Constraint: same span between adjacent time steps should have similar temperatures
-        # |dT[i+1, j] - dT[i, j]| should be small (< 3°C)
-        temporal_penalties = []
+        temporal_residuals = []
         if self.temp_temporal_weight > 0:
-            for i in range(self.n_cases - 1):
+            for i in range(self.n_cases - 1):  # n_cases - 1 pairs
                 dT_curr = np.array(thermal_states[i].dT_spans)
                 dT_next = np.array(thermal_states[i+1].dT_spans)
-                # Penalize large differences between consecutive time steps
-                for j in range(3):  # all 3 spans
+                for j in range(3):  # 3 spans
                     diff = dT_next[j] - dT_curr[j]
-                    # Smooth penalty that increases beyond ±3°C
-                    if abs(diff) > 3.0:
-                        penalty = (abs(diff) - 3.0) * self.temp_temporal_weight
-                        temporal_penalties.append(penalty)
+                    # Soft L1 penalty
+                    penalty = max(0.0, abs(diff) - 3.0) * self.temp_temporal_weight
+                    temporal_residuals.append(penalty)
         
-        # Combine all residuals
+        # Combine all residuals with fixed size
         all_residuals = [physics_residuals]
-        if spatial_penalties:
-            all_residuals.append(np.array(spatial_penalties))
-        if temporal_penalties:
-            all_residuals.append(np.array(temporal_penalties))
+        if spatial_residuals:
+            all_residuals.append(np.array(spatial_residuals))
+        if temporal_residuals:
+            all_residuals.append(np.array(temporal_residuals))
         
         return np.concatenate(all_residuals)
     
