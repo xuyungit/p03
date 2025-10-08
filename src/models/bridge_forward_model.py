@@ -50,9 +50,18 @@ class StructuralParams:
 
 @dataclass
 class ThermalState:
-    """Per-sample temperature gradient parameters."""
+    """Per-sample temperature gradient parameters.
 
-    dT_spans: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    Supports either three per-span values (legacy, one per 40 m span),
+    or two half-bridge values (50%/50% split along total length).
+
+    - If ``len(dT_spans) == 3``: use per-span mapping as before.
+    - If ``len(dT_spans) == 2``: use equal-length two-segment mapping, where
+      the first value applies to the first half of the 120 m bridge and the
+      second value applies to the second half.
+    """
+
+    dT_spans: Tuple[float, ...] = (0.0, 0.0, 0.0)
 
 
 @dataclass
@@ -248,14 +257,59 @@ def assemble_structural_system(struct_params: StructuralParams) -> StructuralSys
 
 
 def thermal_load_vector(system: StructuralSystem, thermal_state: ThermalState) -> np.ndarray:
+    """Assemble the global thermal load vector for the given thermal state.
+
+    Behavior:
+    - Three values (legacy): per-span constant gradients (one per span).
+    - Two values: 50%/50% split across the total length; elements with
+      midpoints in the first half use the first value, others use the second.
+    """
     loads = np.zeros_like(system.load_base)
-    kappa_span = tuple((ALPHA / H_MM) * np.array(thermal_state.dT_spans))
-    for n1, n2, L, si in system.mesh.elements:
-        ei = system.span_ei[si]
-        fth = f_thermal(ei, kappa_span[si])
-        dof = [2 * n1, 2 * n1 + 1, 2 * n2, 2 * n2 + 1]
-        loads[dof] += fth
-    return loads
+
+    dT = tuple(thermal_state.dT_spans)
+    nvals = len(dT)
+    scale = (ALPHA / H_MM)
+
+    # Fast path: legacy 3-per-span behavior
+    if nvals == 3:
+        kappa_span = tuple(scale * np.array(dT))
+        for n1, n2, L, si in system.mesh.elements:
+            ei = system.span_ei[si]
+            fth = f_thermal(ei, kappa_span[si])
+            dof = [2 * n1, 2 * n1 + 1, 2 * n2, 2 * n2 + 1]
+            loads[dof] += fth
+        return loads
+
+    # Two-value mode: equal-length two segments (first half / second half)
+    if nvals == 2:
+        x_coords = system.mesh.x_coords
+        half = TOTAL_LEN / 2.0
+        kappa_left = scale * dT[0]
+        kappa_right = scale * dT[1]
+        for n1, n2, L, si in system.mesh.elements:
+            # element midpoint coordinate
+            x_mid = 0.5 * (x_coords[n1] + x_coords[n2])
+            kappa = kappa_left if x_mid < half else kappa_right
+            ei = system.span_ei[si]
+            fth = f_thermal(ei, kappa)
+            dof = [2 * n1, 2 * n1 + 1, 2 * n2, 2 * n2 + 1]
+            loads[dof] += fth
+        return loads
+
+    # Fallback: single uniform value across entire bridge, or raise
+    if nvals == 1:
+        kappa = scale * dT[0]
+        for n1, n2, L, si in system.mesh.elements:
+            ei = system.span_ei[si]
+            fth = f_thermal(ei, kappa)
+            dof = [2 * n1, 2 * n1 + 1, 2 * n2, 2 * n2 + 1]
+            loads[dof] += fth
+        return loads
+
+    raise ValueError(
+        f"Unsupported number of temperature values: {nvals}. "
+        "Provide 3 (per span) or 2 (half/half)."
+    )
 
 
 def solve_with_system(system: StructuralSystem, thermal_state: ThermalState) -> Tuple[np.ndarray, np.ndarray]:

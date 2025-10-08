@@ -146,7 +146,7 @@ class CaseParams:
     kv_factors: Tuple[float, float, float, float]
     settlements: Tuple[float, float, float, float]  # mm（A=0, B/C/D 相对 mm）
     ei_factors: Tuple[float, float, float]
-    dT_spans: Tuple[float, float, float]  # °C
+    dT_spans: Tuple[float, ...]  # °C; 支持3段（每跨）或2段（全长50/50）
     q: float = Q_UNIFORM
     ne_per_span: int = 64
 
@@ -161,15 +161,32 @@ def solve_case(params: CaseParams) -> Tuple[np.ndarray, np.ndarray, List[float]]
     K = np.zeros((ndof, ndof))
     F = np.zeros(ndof)
 
-    # 热曲率
-    kappa_span = tuple((ALPHA / H_MM) * np.array(params.dT_spans))
+    # 热曲率（支持 2 段或 3 段）
+    dT_vals = tuple(params.dT_spans)
+    nT = len(dT_vals)
+    scale = (ALPHA / H_MM)
+    if nT == 3:
+        kappa_span = tuple(scale * np.array(dT_vals))
+    elif nT == 2:
+        kappa_left = scale * dT_vals[0]
+        kappa_right = scale * dT_vals[1]
+    else:
+        # 单一值：全桥均匀
+        kappa_uniform = scale * dT_vals[0]
 
     # 组装
     for n1, n2, L, si in elements:
         ei = EI_BASE * params.ei_factors[si]
         ke = k_beam(ei, L)
         fe = f_udl(params.q, L)
-        fth = f_thermal(ei, kappa_span[si])
+        if nT == 3:
+            kappa = kappa_span[si]
+        elif nT == 2:
+            x_mid = 0.5 * (x_coords[n1] + x_coords[n2])
+            kappa = kappa_left if x_mid < TOTAL_LEN / 2.0 else kappa_right
+        else:
+            kappa = kappa_uniform
+        fth = f_thermal(ei, kappa)
         dof = [2 * n1, 2 * n1 + 1, 2 * n2, 2 * n2 + 1]
         K[np.ix_(dof, dof)] += ke
         F[dof] += fe - fth
@@ -206,11 +223,18 @@ def sample_cases_lhs(
     n: int,
     seed: int | None = None,
     lhs_backend: str = "auto",
+    temp_segments: int = 3,
 ) -> List[CaseParams]:
     rng = np.random.default_rng(seed)
 
-    # 维度：B/C/D 沉降(3) + Kv系数(4) + EI系数(3) + 温度3维（t1, dt12, dt23） = 13
-    U = lhs_unit_hypercube(n, dims=13, rng=rng, seed=seed, backend=lhs_backend)
+    # 维度：B/C/D 沉降(3) + Kv系数(4) + EI系数(3) + 温度维数
+    if temp_segments == 3:
+        dims = 13  # t1, dt12, dt23
+    elif temp_segments == 2:
+        dims = 12  # t_left, dt_lr
+    else:
+        raise ValueError("temp_segments must be 2 or 3")
+    U = lhs_unit_hypercube(n, dims=dims, rng=rng, seed=seed, backend=lhs_backend)
 
     # 1) 沉降：A=0，B/C/D ∈ [-10, 10]
     sett_bcd = scale(U[:, 0:3], -10.0, 10.0)
@@ -223,29 +247,34 @@ def sample_cases_lhs(
     # 3) EI 系数：3 跨 ∈ [0.3, 1.5]
     ei_factors = scale(U[:, 7:10], 0.3, 1.5)
 
-    # 4) 温度：
-    #    先采 t1 ∈ [-10, 20]，再基于当前值对相邻差值进行“逐步截断映射”，
-    #    即 s1 ∈ [max(-5, -10-t1), min(5, 20-t1)]，t2 = t1 + s1；
-    #    s2 ∈ [max(-5, -10-t2), min(5, 20-t2)]，t3 = t2 + s2。
-    #    这样无需 clip，天然保证每跨在 [-10,20] 且相邻差值 ≤ 5。
-    t1 = scale(U[:, 10], -10.0, 20.0)
-    u12 = U[:, 11]
-    u23 = U[:, 12]
-    t2 = np.zeros_like(t1)
-    t3 = np.zeros_like(t1)
-    for i in range(n):
-        # 针对第 i 个样本，计算允许的差值范围并映射
-        low1 = max(-5.0, -10.0 - t1[i])
-        high1 = min(5.0, 20.0 - t1[i])
-        s1 = low1 + (high1 - low1) * u12[i]
-        t2[i] = t1[i] + s1
+    # 4) 温度：与 3 段一致地采用逐步截断映射，保证相邻差值 ≤ 5 且范围 [-10,20]
+    if temp_segments == 3:
+        t1 = scale(U[:, 10], -10.0, 20.0)
+        u12 = U[:, 11]
+        u23 = U[:, 12]
+        t2 = np.zeros_like(t1)
+        t3 = np.zeros_like(t1)
+        for i in range(n):
+            low1 = max(-5.0, -10.0 - t1[i])
+            high1 = min(5.0, 20.0 - t1[i])
+            s1 = low1 + (high1 - low1) * u12[i]
+            t2[i] = t1[i] + s1
 
-        low2 = max(-5.0, -10.0 - t2[i])
-        high2 = min(5.0, 20.0 - t2[i])
-        s2 = low2 + (high2 - low2) * u23[i]
-        t3[i] = t2[i] + s2
-
-    dT_spans = np.stack([t1, t2, t3], axis=1)
+            low2 = max(-5.0, -10.0 - t2[i])
+            high2 = min(5.0, 20.0 - t2[i])
+            s2 = low2 + (high2 - low2) * u23[i]
+            t3[i] = t2[i] + s2
+        dT_spans = np.stack([t1, t2, t3], axis=1)
+    else:
+        tL = scale(U[:, 10], -10.0, 20.0)
+        uLR = U[:, 11]
+        tR = np.zeros_like(tL)
+        for i in range(n):
+            low = max(-5.0, -10.0 - tL[i])
+            high = min(5.0, 20.0 - tL[i])
+            s = low + (high - low) * uLR[i]
+            tR[i] = tL[i] + s
+        dT_spans = np.stack([tL, tR], axis=1)
 
     cases: List[CaseParams] = []
     for i in range(n):
@@ -260,7 +289,7 @@ def sample_cases_lhs(
     return cases
 
 
-PARAMETER_CSV_REQUIRED_COLS = [
+PARAMETER_CSV_REQUIRED_COLS_3 = [
     "settlement_b_mm",
     "settlement_c_mm",
     "settlement_d_mm",
@@ -274,6 +303,20 @@ PARAMETER_CSV_REQUIRED_COLS = [
     "dT_s1_C",
     "dT_s2_C",
     "dT_s3_C",
+]
+PARAMETER_CSV_REQUIRED_COLS_2 = [
+    "settlement_b_mm",
+    "settlement_c_mm",
+    "settlement_d_mm",
+    "kv_factor_a",
+    "kv_factor_b",
+    "kv_factor_c",
+    "kv_factor_d",
+    "ei_factor_s1",
+    "ei_factor_s2",
+    "ei_factor_s3",
+    "dT_left_C",
+    "dT_right_C",
 ]
 
 PARAMETER_CSV_OPTIONAL_SETTLEMENT_A = "settlement_a_mm"
@@ -297,10 +340,11 @@ def load_cases_from_parameter_csv(param_csv: Path) -> Tuple[List[CaseParams], Li
     """从 CSV 加载参数，构造 CaseParams 列表及可选的 sample_id 序列。"""
     df = pd.read_csv(param_csv)
 
-    missing = [col for col in PARAMETER_CSV_REQUIRED_COLS if col not in df.columns]
-    if missing:
+    has_3 = all(c in df.columns for c in PARAMETER_CSV_REQUIRED_COLS_3)
+    has_2 = all(c in df.columns for c in PARAMETER_CSV_REQUIRED_COLS_2)
+    if not (has_3 or has_2):
         raise ValueError(
-            "参数 CSV 缺少必需列: " + ", ".join(missing)
+            "参数 CSV 缺少必需列: 需要 {dT_s1_C,dT_s2_C,dT_s3_C} 或 {dT_left_C,dT_right_C}"
         )
 
     has_sample_id = "sample_id" in df.columns
@@ -328,11 +372,17 @@ def load_cases_from_parameter_csv(param_csv: Path) -> Tuple[List[CaseParams], Li
             _safe_float(record["ei_factor_s3"], 1.0),
         )
 
-        dT_spans = (
-            _safe_float(record["dT_s1_C"], 0.0),
-            _safe_float(record["dT_s2_C"], 0.0),
-            _safe_float(record["dT_s3_C"], 0.0),
-        )
+        if has_3:
+            dT_spans = (
+                _safe_float(record["dT_s1_C"], 0.0),
+                _safe_float(record["dT_s2_C"], 0.0),
+                _safe_float(record["dT_s3_C"], 0.0),
+            )
+        else:
+            dT_spans = (
+                _safe_float(record["dT_left_C"], 0.0),
+                _safe_float(record["dT_right_C"], 0.0),
+            )
 
         q_value = None
         for col in PARAMETER_CSV_Q_CANDIDATES:
@@ -414,9 +464,9 @@ def generate_dataset(
             "ei_factor_s1": c.ei_factors[0],
             "ei_factor_s2": c.ei_factors[1],
             "ei_factor_s3": c.ei_factors[2],
-            "dT_s1_C": c.dT_spans[0],
-            "dT_s2_C": c.dT_spans[1],
-            "dT_s3_C": c.dT_spans[2],
+            # 温度列：根据段数输出
+            **({"dT_s1_C": c.dT_spans[0], "dT_s2_C": c.dT_spans[1], "dT_s3_C": c.dT_spans[2]} if len(c.dT_spans) == 3 else
+               {"dT_left_C": c.dT_spans[0], "dT_right_C": c.dT_spans[1]}),
             "uniform_load_N_per_mm": c.q,
             # 输出（kN）
             "R_a_kN": Rlist[0],
@@ -536,6 +586,13 @@ def main():
         choices=["auto", "scipy", "builtin"],
         help="LHS 后端：auto优先SciPy，否则回退；scipy强制SciPy；builtin内置实现",
     )
+    parser.add_argument(
+        "--temp-segments",
+        type=int,
+        default=3,
+        choices=[2, 3],
+        help="温度分段数：3=每跨；2=按全长50/50",
+    )
     args = parser.parse_args()
 
     out_path = Path(args.out)
@@ -546,7 +603,7 @@ def main():
         cases, sample_ids = load_cases_from_parameter_csv(param_path)
         print(f"从参数 CSV 加载 {len(cases)} 条样本: {param_path}")
     else:
-        cases = sample_cases_lhs(n=args.n, seed=args.seed, lhs_backend=args.lhs)
+        cases = sample_cases_lhs(n=args.n, seed=args.seed, lhs_backend=args.lhs, temp_segments=int(args.temp_segments))
         sample_ids = None
 
     df = generate_dataset(

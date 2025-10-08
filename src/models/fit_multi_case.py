@@ -72,6 +72,7 @@ class MultiCaseFitter:
         ne_per_span: int = 64,
         temp_spatial_weight: float = 1.0,  # Weight for spatial smoothness
         temp_temporal_weight: float = 1.0,  # Weight for temporal smoothness
+        temp_segments: int = 3,
     ):
         """
         Args:
@@ -87,6 +88,9 @@ class MultiCaseFitter:
         self.ne_per_span = ne_per_span
         self.temp_spatial_weight = temp_spatial_weight
         self.temp_temporal_weight = temp_temporal_weight
+        if temp_segments not in (2, 3):
+            raise ValueError("temp_segments must be 2 or 3")
+        self.temp_segments = temp_segments
         
         print(f"\n多工况拟合设置:")
         print(f"  工况数量: {self.n_cases}")
@@ -94,6 +98,7 @@ class MultiCaseFitter:
         print(f"  总约束数: {self.n_cases * 4}")
         print(f"  温度空间正则化权重: {temp_spatial_weight}")
         print(f"  温度时间正则化权重: {temp_temporal_weight}")
+        print(f"  温度分段数: {self.temp_segments}")
     
     def _build_x0_and_bounds(
         self,
@@ -121,23 +126,24 @@ class MultiCaseFitter:
             lower_list.extend([0.1] * 4)
             upper_list.extend([3.0] * 4)
         
-        # Temperature gradients (3 per case, varying)
+        # Temperature gradients (nT per case, varying)
         # Tighter bounds: [-10, 20]°C
+        nT = self.temp_segments
         for _ in range(self.n_cases):
-            x0_list.extend([10.0, 10.0, 10.0])  # Start near middle of expected range
-            lower_list.extend([-10.0] * 3)
-            upper_list.extend([20.0] * 3)
+            x0_list.extend([10.0] * nT)  # Start near middle of expected range
+            lower_list.extend([-10.0] * nT)
+            upper_list.extend([20.0] * nT)
         
         x0 = np.array(x0_list)
         lower = np.array(lower_list)
         upper = np.array(upper_list)
         
         n_struct_params = 11 if fit_struct else 0
-        n_temp_params = self.n_cases * 3
+        n_temp_params = self.n_cases * self.temp_segments
         
         print(f"\n参数空间:")
         print(f"  结构参数 (固定): {n_struct_params if fit_struct else 0}")
-        print(f"  温度参数 (变化): {n_temp_params} ({self.n_cases} 工况 × 3)")
+        print(f"  温度参数 (变化): {n_temp_params} ({self.n_cases} 工况 × {self.temp_segments})")
         print(f"  温度范围: [-10, 20]°C")
         print(f"  总参数数: {len(x0)}")
         print(f"  自由度: {self.n_cases * 4} 约束 - {len(x0)} 参数 = {self.n_cases * 4 - len(x0)}")
@@ -175,10 +181,11 @@ class MultiCaseFitter:
         
         # Temperature states (one per case)
         thermal_states = []
+        nT = self.temp_segments
         for _ in range(self.n_cases):
-            dT_spans = tuple(x[idx:idx+3])
-            thermal_states.append(ThermalState(dT_spans=dT_spans))  # type: ignore[arg-type]
-            idx += 3
+            dT_vals = tuple(x[idx:idx+nT])
+            thermal_states.append(ThermalState(dT_spans=dT_vals))  # type: ignore[arg-type]
+            idx += nT
         
         return struct_params, thermal_states
     
@@ -207,23 +214,23 @@ class MultiCaseFitter:
         # Use soft penalty instead of conditional penalty
         spatial_residuals = []
         if self.temp_spatial_weight > 0:
+            n_adj = max(0, self.temp_segments - 1)
             for i in range(self.n_cases):
                 dT = np.array(thermal_states[i].dT_spans)
-                for j in range(2):  # 2 adjacent pairs per case
+                for j in range(n_adj):
                     diff = dT[j+1] - dT[j]
-                    # Soft L1 penalty: only penalize beyond threshold
                     penalty = max(0.0, abs(diff) - 5.0) * self.temp_spatial_weight
                     spatial_residuals.append(penalty)
         
         # 3. Temperature temporal smoothness regularization
         temporal_residuals = []
         if self.temp_temporal_weight > 0:
+            nT = self.temp_segments
             for i in range(self.n_cases - 1):  # n_cases - 1 pairs
                 dT_curr = np.array(thermal_states[i].dT_spans)
                 dT_next = np.array(thermal_states[i+1].dT_spans)
-                for j in range(3):  # 3 spans
+                for j in range(nT):
                     diff = dT_next[j] - dT_curr[j]
-                    # Soft L1 penalty
                     penalty = max(0.0, abs(diff) - 3.0) * self.temp_temporal_weight
                     temporal_residuals.append(penalty)
         
@@ -326,6 +333,13 @@ def main():
         help='使用真实温度（不拟合温度，仅拟合结构参数）',
     )
     parser.add_argument(
+        '--temp-segments',
+        type=int,
+        default=3,
+        choices=[2, 3],
+        help='温度分段数：3=每跨；2=按全长50/50',
+    )
+    parser.add_argument(
         '--output',
         type=Path,
         help='输出结果CSV文件',
@@ -339,7 +353,30 @@ def main():
     
     # Extract reactions
     reactions_matrix = df[['R_a_kN', 'R_b_kN', 'R_c_kN', 'R_d_kN']].to_numpy()
-    true_temps = df[['dT_s1_C', 'dT_s2_C', 'dT_s3_C']].to_numpy()
+    # Temperature columns: support both 3-span and 2-half schemas
+    requested_segments = int(args.temp_segments)
+    cols3 = ['dT_s1_C', 'dT_s2_C', 'dT_s3_C']
+    cols2 = ['dT_left_C', 'dT_right_C']
+    if requested_segments == 3:
+        if all(c in df.columns for c in cols3):
+            true_temps = df[cols3].to_numpy()
+            actual_segments = 3
+        elif all(c in df.columns for c in cols2):
+            print('提示: 数据文件仅含2段温度列，自动切换为2段模式。')
+            true_temps = df[cols2].to_numpy()
+            actual_segments = 2
+        else:
+            raise SystemExit('缺少温度列：需要 dT_s1_C/dT_s2_C/dT_s3_C 或 dT_left_C/dT_right_C')
+    else:
+        if all(c in df.columns for c in cols2):
+            true_temps = df[cols2].to_numpy()
+            actual_segments = 2
+        elif all(c in df.columns for c in cols3):
+            print('提示: 数据文件仅含3段温度列，自动切换为3段模式。')
+            true_temps = df[cols3].to_numpy()
+            actual_segments = 3
+        else:
+            raise SystemExit('缺少温度列：需要 dT_left_C/dT_right_C 或 dT_s1_C/dT_s2_C/dT_s3_C')
     uniform_load = float(df['uniform_load_N_per_mm'].iloc[0])
     
     # If using true temperatures, only fit structural parameters
@@ -420,6 +457,9 @@ def main():
         fitter = FixedTempFitter(
             reactions_matrix=reactions_matrix,
             uniform_load=uniform_load,
+            temp_spatial_weight=args.temp_spatial_weight,
+            temp_temporal_weight=args.temp_temporal_weight,
+            temp_segments=actual_segments,
             true_temps=true_temps,
         )
     else:
@@ -429,6 +469,7 @@ def main():
             uniform_load=uniform_load,
             temp_spatial_weight=args.temp_spatial_weight,
             temp_temporal_weight=args.temp_temporal_weight,
+            temp_segments=requested_segments,
         )
     
     # Fit
@@ -512,7 +553,7 @@ def main():
     spatial_diffs = []
     for ts in result['thermal_states']:
         dT = np.array(ts.dT_spans)
-        for j in range(2):
+        for j in range(max(0, len(dT) - 1)):
             spatial_diffs.append(abs(dT[j+1] - dT[j]))
     
     spatial_diffs = np.array(spatial_diffs)
@@ -526,7 +567,7 @@ def main():
     for i in range(len(result['thermal_states']) - 1):
         dT_curr = np.array(result['thermal_states'][i].dT_spans)
         dT_next = np.array(result['thermal_states'][i+1].dT_spans)
-        for j in range(3):
+        for j in range(len(dT_curr)):
             temporal_diffs.append(abs(dT_next[j] - dT_curr[j]))
     
     temporal_diffs = np.array(temporal_diffs)
@@ -538,11 +579,18 @@ def main():
     # Temperature statistics (first few cases)
     print(f"\n温度梯度示例 (前5个工况):")
     for i in range(min(5, len(result['thermal_states']))):
-        fitted_dT = result['thermal_states'][i].dT_spans
-        true_dT = true_temps[i]
+        fitted_dT = tuple(result['thermal_states'][i].dT_spans)
+        true_dT = tuple(true_temps[i])
         print(f"  Case {i}:")
-        print(f"    真实: [{true_dT[0]:6.2f}, {true_dT[1]:6.2f}, {true_dT[2]:6.2f}]°C")
-        print(f"    拟合: [{fitted_dT[0]:6.2f}, {fitted_dT[1]:6.2f}, {fitted_dT[2]:6.2f}]°C")
+        if len(fitted_dT) == 3 and len(true_dT) == 3:
+            print(f"    真实: [{true_dT[0]:6.2f}, {true_dT[1]:6.2f}, {true_dT[2]:6.2f}]°C")
+            print(f"    拟合: [{fitted_dT[0]:6.2f}, {fitted_dT[1]:6.2f}, {fitted_dT[2]:6.2f}]°C")
+        elif len(fitted_dT) == 2 and len(true_dT) == 2:
+            print(f"    真实: [L={true_dT[0]:6.2f}, R={true_dT[1]:6.2f}]°C")
+            print(f"    拟合: [L={fitted_dT[0]:6.2f}, R={fitted_dT[1]:6.2f}]°C")
+        else:
+            print(f"    真实: {true_temps[i]}")
+            print(f"    拟合: {fitted_dT}")
     
     # Save results
     if args.output:
@@ -560,9 +608,13 @@ def main():
         output_df['kv_factor_d_fitted'] = sp.kv_factors[3]
         
         for i, ts in enumerate(result['thermal_states']):
-            output_df.loc[i, 'dT_s1_fitted'] = ts.dT_spans[0]
-            output_df.loc[i, 'dT_s2_fitted'] = ts.dT_spans[1]
-            output_df.loc[i, 'dT_s3_fitted'] = ts.dT_spans[2]
+            if len(ts.dT_spans) == 3:
+                output_df.loc[i, 'dT_s1_fitted'] = ts.dT_spans[0]
+                output_df.loc[i, 'dT_s2_fitted'] = ts.dT_spans[1]
+                output_df.loc[i, 'dT_s3_fitted'] = ts.dT_spans[2]
+            else:
+                output_df.loc[i, 'dT_left_fitted'] = ts.dT_spans[0]
+                output_df.loc[i, 'dT_right_fitted'] = ts.dT_spans[1]
         
         for i in range(4):
             output_df[f'residual_R{i+1}'] = residuals[:, i]

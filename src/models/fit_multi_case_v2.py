@@ -74,10 +74,7 @@ def load_multi_case_data(csv_paths: List[Path], max_samples: int | None = None) 
         print(f"  文件 {i+1}: {csv_path.name} ({len(df)} 条数据)")
         dfs.append(df)
     
-    # Concatenate all dataframes
-    df = pd.concat(dfs, ignore_index=True)
-    
-    # Concatenate all dataframes
+    # Concatenate all dataframes (once)
     df = pd.concat(dfs, ignore_index=True)
     
     # Reset sample_id to be continuous across all files
@@ -117,53 +114,59 @@ def f_thermal_element(ei: float, kappa: float) -> np.ndarray:
 
 def batch_thermal_load_vectors(
     system: StructuralSystem,
-    dT_matrix: np.ndarray,  # shape: (n_cases, 3) - temperatures for all cases
+    dT_matrix: np.ndarray,  # shape: (n_cases, 2 or 3)
 ) -> np.ndarray:
     """Vectorized computation of thermal load vectors for all cases.
-    
+
+    Supports both 3-span (per-span) and 2-segment (50/50) temperature inputs.
+
     Args:
         system: Structural system
-        dT_matrix: Temperature gradients, shape (n_cases, 3)
-    
+        dT_matrix: Temperature gradients, shape (n_cases, 2 or 3)
+
     Returns:
         Load vectors, shape (n_cases, ndof)
     """
-    n_cases = dT_matrix.shape[0]
+    n_cases, nT = dT_matrix.shape
     ndof = len(system.load_base)
-    
+
     # Pre-allocate result
     loads_all = np.zeros((n_cases, ndof), dtype=float)
-    
-    # Convert temperatures to curvatures: (n_cases, 3)
+
+    # Convert temperatures to curvatures
     kappa_matrix = (ALPHA / H_MM) * dT_matrix
-    
-    # Iterate over elements (this part is hard to vectorize due to assembly)
+
+    # Iterate over elements (assembly is inherently sparse)
+    x_coords = system.mesh.x_coords
+    half = x_coords[-1] / 2.0
     for n1, n2, L, si in system.mesh.elements:
         ei = system.span_ei[si]
-        # Thermal loads for all cases at once: (n_cases,)
-        kappa_cases = kappa_matrix[:, si]
-        
-        # Compute thermal loads for this element across all cases
-        # f_thermal = ei * kappa * [0, -1, 0, +1]
-        # 注意：这里是固定端弯矩等效载荷
+        if nT == 3:
+            kappa_cases = kappa_matrix[:, si]
+        elif nT == 2:
+            x_mid = 0.5 * (x_coords[n1] + x_coords[n2])
+            idx = 0 if x_mid < half else 1
+            kappa_cases = kappa_matrix[:, idx]
+        else:
+            # Treat as uniform across bridge if a single column is supplied
+            kappa_cases = kappa_matrix[:, 0]
+
         dof_indices = [2 * n1, 2 * n1 + 1, 2 * n2, 2 * n2 + 1]
-        
-        # Vectorized assembly - 注意符号！
-        loads_all[:, dof_indices[1]] -= ei * kappa_cases  # moment at node 1: -EI*kappa
-        loads_all[:, dof_indices[3]] += ei * kappa_cases  # moment at node 2: +EI*kappa
-    
+        loads_all[:, dof_indices[1]] -= ei * kappa_cases  # node 1 moment
+        loads_all[:, dof_indices[3]] += ei * kappa_cases  # node 2 moment
+
     return loads_all
 
 
 def batch_solve_with_system(
     system: StructuralSystem,
-    dT_matrix: np.ndarray,  # shape: (n_cases, 3)
+    dT_matrix: np.ndarray,  # shape: (n_cases, 2 or 3)
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Batch solve for all cases simultaneously.
     
     Args:
         system: Structural system
-        dT_matrix: Temperature gradients, shape (n_cases, 3)
+        dT_matrix: Temperature gradients, shape (n_cases, 2 or 3)
     
     Returns:
         U_all: Displacements, shape (n_cases, ndof)
@@ -202,6 +205,7 @@ class VectorizedMultiCaseFitter:
         temp_temporal_weight: float = 1.0,
         fixed_kv_factors: tuple[float, float, float, float] | None = None,
         fix_first_settlement: bool = True,
+        temp_segments: int = 3,
     ):
         """
         Args:
@@ -221,14 +225,17 @@ class VectorizedMultiCaseFitter:
         self.temp_temporal_weight = temp_temporal_weight
         self.fixed_kv_factors = fixed_kv_factors
         self.fix_first_settlement = fix_first_settlement
+        if temp_segments not in (2, 3):
+            raise ValueError("temp_segments must be 2 or 3")
+        self.temp_segments = temp_segments
         
         # Cache
         self._cached_system: StructuralSystem | None = None
         self._cached_struct_params: tuple | None = None
         
-        # Pre-allocate arrays for regularization
-        self._spatial_residuals = np.zeros(self.n_cases * 2, dtype=float)
-        self._temporal_residuals = np.zeros((self.n_cases - 1) * 3, dtype=float)
+        # Pre-allocate arrays for regularization (sizes depend on temp_segments)
+        self._spatial_residuals = np.zeros(self.n_cases * max(0, self.temp_segments - 1), dtype=float)
+        self._temporal_residuals = np.zeros((self.n_cases - 1) * self.temp_segments, dtype=float)
         
         # Statistics
         self._n_residual_calls = 0
@@ -242,7 +249,7 @@ class VectorizedMultiCaseFitter:
         print(f"  总约束数: {self.n_cases * 4}")
         print(f"  KV参数: {kv_status}")
         print(f"  沉降参数: {settlement_status}")
-        print(f"  优化特性: 批量求解 + 向量化温度载荷")
+        print(f"  优化特性: 批量求解 + 向量化温度载荷 (nT={self.temp_segments})")
     
     def _build_x0_and_bounds(
         self,
@@ -277,11 +284,12 @@ class VectorizedMultiCaseFitter:
                 lower_list.extend([0.1] * 4)
                 upper_list.extend([3.0] * 4)
         
-        # Temperature gradients (3 per case)
+        # Temperature gradients (nT per case)
+        nT = self.temp_segments
         for _ in range(self.n_cases):
-            x0_list.extend([10.0, 10.0, 10.0])
-            lower_list.extend([-10.0] * 3)
-            upper_list.extend([20.0] * 3)
+            x0_list.extend([10.0] * nT)
+            lower_list.extend([-10.0] * nT)
+            upper_list.extend([20.0] * nT)
         
         x0 = np.array(x0_list)
         lower = np.array(lower_list)
@@ -292,11 +300,11 @@ class VectorizedMultiCaseFitter:
         n_ei = 3 if fit_struct else 0
         n_kv = 0 if (not fit_struct or self.fixed_kv_factors is not None) else 4
         n_struct = n_settlement + n_ei + n_kv
-        n_temp = self.n_cases * 3
+        n_temp = self.n_cases * self.temp_segments
         
         print(f"\n参数空间:")
         print(f"  结构参数: {n_struct} (沉降: {n_settlement}, EI: {n_ei}, KV: {n_kv})")
-        print(f"  温度参数: {n_temp} ({self.n_cases} × 3)")
+        print(f"  温度参数: {n_temp} ({self.n_cases} × {self.temp_segments})")
         print(f"  总参数数: {len(x0)}")
         
         return x0, (lower, upper)
@@ -310,7 +318,7 @@ class VectorizedMultiCaseFitter:
         
         Returns:
             struct_params: StructuralParams object
-            dT_matrix: Temperature matrix, shape (n_cases, 3)
+            dT_matrix: Temperature matrix, shape (n_cases, nT)
         """
         idx = 0
         
@@ -345,8 +353,8 @@ class VectorizedMultiCaseFitter:
             ne_per_span=self.ne_per_span,
         )
         
-        # Extract temperature matrix: (n_cases, 3)
-        dT_matrix = x[idx:].reshape(self.n_cases, 3)
+        # Extract temperature matrix: (n_cases, nT)
+        dT_matrix = x[idx:].reshape(self.n_cases, self.temp_segments)
         
         return struct_params, dT_matrix
     
@@ -380,41 +388,32 @@ class VectorizedMultiCaseFitter:
         struct_params, dT_matrix = self._unpack_params(x, fit_struct)
         system = self._get_or_assemble_system(struct_params)
         
-        # 1. Batch solve for all cases at once
+        # 1. Reactions residuals (batch for both 2- and 3-segment modes)
         _, reactions_all = batch_solve_with_system(system, dT_matrix)
-        
-        # Physics residuals: (n_cases, 4) -> (n_cases * 4,)
+
         physics_residuals = (reactions_all - self.reactions_matrix).ravel()
-        
-        # 2. Vectorized spatial regularization
+
+        # 2. Spatial regularization
         if self.temp_spatial_weight > 0:
-            # Compute differences between adjacent spans within each case
-            # dT_matrix: (n_cases, 3), we want diff[:, 1] - diff[:, 0] and diff[:, 2] - diff[:, 1]
-            diff_01 = dT_matrix[:, 1] - dT_matrix[:, 0]  # (n_cases,)
-            diff_12 = dT_matrix[:, 2] - dT_matrix[:, 1]  # (n_cases,)
-            
-            # Soft L1 penalty: max(0, |diff| - 5.0)
-            spatial_penalty_01 = np.maximum(0.0, np.abs(diff_01) - 5.0) * self.temp_spatial_weight
-            spatial_penalty_12 = np.maximum(0.0, np.abs(diff_12) - 5.0) * self.temp_spatial_weight
-            
-            # Interleave: [case0_01, case0_12, case1_01, case1_12, ...]
-            self._spatial_residuals[0::2] = spatial_penalty_01
-            self._spatial_residuals[1::2] = spatial_penalty_12
+            if self.temp_segments == 3:
+                diff_01 = dT_matrix[:, 1] - dT_matrix[:, 0]
+                diff_12 = dT_matrix[:, 2] - dT_matrix[:, 1]
+                spatial_penalty_01 = np.maximum(0.0, np.abs(diff_01) - 5.0) * self.temp_spatial_weight
+                spatial_penalty_12 = np.maximum(0.0, np.abs(diff_12) - 5.0) * self.temp_spatial_weight
+                self._spatial_residuals[0::2] = spatial_penalty_01
+                self._spatial_residuals[1::2] = spatial_penalty_12
+            else:
+                # Only one adjacent pair per case in 2-seg mode
+                diff = dT_matrix[:, 1] - dT_matrix[:, 0]
+                spatial_penalty = np.maximum(0.0, np.abs(diff) - 5.0) * self.temp_spatial_weight
+                self._spatial_residuals[:] = spatial_penalty
         else:
             self._spatial_residuals[:] = 0.0
-        
-        # 3. Vectorized temporal regularization
+
+        # 3. Temporal regularization
         if self.temp_temporal_weight > 0:
-            # Compute differences between consecutive cases
-            # NOTE: This works across file boundaries when multiple files are concatenated,
-            # ensuring smooth temperature transitions throughout the entire time series
-            # dT_matrix: (n_cases, 3), we want dT[i+1] - dT[i] for each span
-            dT_diff = dT_matrix[1:, :] - dT_matrix[:-1, :]  # (n_cases-1, 3)
-            
-            # Soft L1 penalty: max(0, |diff| - 3.0)
+            dT_diff = dT_matrix[1:, :] - dT_matrix[:-1, :]
             temporal_penalty = np.maximum(0.0, np.abs(dT_diff) - 3.0) * self.temp_temporal_weight
-            
-            # Flatten: (n_cases-1, 3) -> ((n_cases-1) * 3,)
             self._temporal_residuals[:] = temporal_penalty.ravel()
         else:
             self._temporal_residuals[:] = 0.0
@@ -501,6 +500,8 @@ def main():
     parser.add_argument('--no-fix-first-settlement', action='store_true',
                         help='不固定第一个沉降为0（默认固定settlement_a=0作为参考点）')
     parser.add_argument('--output', type=Path, help='输出CSV文件')
+    parser.add_argument('--temp-segments', type=int, default=3, choices=[2, 3],
+                        help='温度分段数：3=每跨；2=按全长50/50')
     
     args = parser.parse_args()
     
@@ -511,7 +512,30 @@ def main():
     df, const_params = load_multi_case_data(args.data, args.max_samples)
     
     reactions_matrix = df[['R_a_kN', 'R_b_kN', 'R_c_kN', 'R_d_kN']].to_numpy()
-    true_temps = df[['dT_s1_C', 'dT_s2_C', 'dT_s3_C']].to_numpy()
+    # Temperature columns detection
+    requested_segments = int(args.temp_segments)
+    cols3 = ['dT_s1_C', 'dT_s2_C', 'dT_s3_C']
+    cols2 = ['dT_left_C', 'dT_right_C']
+    if requested_segments == 3:
+        if all(c in df.columns for c in cols3):
+            true_temps = df[cols3].to_numpy()
+            actual_segments = 3
+        elif all(c in df.columns for c in cols2):
+            print('提示: 数据文件仅含2段温度列，自动切换为2段模式。')
+            true_temps = df[cols2].to_numpy()
+            actual_segments = 2
+        else:
+            raise SystemExit('缺少温度列：需要 dT_s1_C/dT_s2_C/dT_s3_C 或 dT_left_C/dT_right_C')
+    else:
+        if all(c in df.columns for c in cols2):
+            true_temps = df[cols2].to_numpy()
+            actual_segments = 2
+        elif all(c in df.columns for c in cols3):
+            print('提示: 数据文件仅含3段温度列，自动切换为3段模式。')
+            true_temps = df[cols3].to_numpy()
+            actual_segments = 3
+        else:
+            raise SystemExit('缺少温度列：需要 dT_left_C/dT_right_C 或 dT_s1_C/dT_s2_C/dT_s3_C')
     uniform_load = float(df['uniform_load_N_per_mm'].iloc[0])
     
     # Parse fixed KV if provided
@@ -531,6 +555,7 @@ def main():
         temp_temporal_weight=args.temp_temporal_weight,
         fixed_kv_factors=fixed_kv_factors,
         fix_first_settlement=fix_first_settlement,
+        temp_segments=actual_segments,
     )
     
     # Fit
@@ -609,11 +634,18 @@ def main():
     # Temperature examples
     print(f"\n温度梯度示例 (前5个工况):")
     for i in range(min(5, len(result['thermal_states']))):
-        fitted_dT = result['thermal_states'][i].dT_spans
-        true_dT = true_temps[i]
+        fitted_dT = tuple(result['thermal_states'][i].dT_spans)
+        true_dT = tuple(true_temps[i])
         print(f"  Case {i}:")
-        print(f"    真实: [{true_dT[0]:6.2f}, {true_dT[1]:6.2f}, {true_dT[2]:6.2f}]°C")
-        print(f"    拟合: [{fitted_dT[0]:6.2f}, {fitted_dT[1]:6.2f}, {fitted_dT[2]:6.2f}]°C")
+        if len(fitted_dT) == 3 and len(true_dT) == 3:
+            print(f"    真实: [{true_dT[0]:6.2f}, {true_dT[1]:6.2f}, {true_dT[2]:6.2f}]°C")
+            print(f"    拟合: [{fitted_dT[0]:6.2f}, {fitted_dT[1]:6.2f}, {fitted_dT[2]:6.2f}]°C")
+        elif len(fitted_dT) == 2 and len(true_dT) == 2:
+            print(f"    真实: [L={true_dT[0]:6.2f}, R={true_dT[1]:6.2f}]°C")
+            print(f"    拟合: [L={fitted_dT[0]:6.2f}, R={fitted_dT[1]:6.2f}]°C")
+        else:
+            print(f"    真实: {true_temps[i]}")
+            print(f"    拟合: {fitted_dT}")
     
     # Forward verification: recompute reactions using fitted parameters
     print(f"\n{'='*60}")
@@ -623,10 +655,8 @@ def main():
     # Assemble system with fitted structural parameters
     fitted_system = assemble_structural_system(result['struct_params'])
     
-    # Extract fitted temperature matrix
+    # Extract fitted temperature matrix and recompute reactions
     fitted_dT_matrix = np.array([ts.dT_spans for ts in result['thermal_states']])
-    
-    # Recompute reactions using forward model
     _, recomputed_reactions = batch_solve_with_system(fitted_system, fitted_dT_matrix)
     
     # Compare with observed reactions
@@ -682,9 +712,13 @@ def main():
         
         # Fitted temperatures
         for i, ts in enumerate(result['thermal_states']):
-            output_df.loc[i, 'dT_s1_fitted'] = ts.dT_spans[0]
-            output_df.loc[i, 'dT_s2_fitted'] = ts.dT_spans[1]
-            output_df.loc[i, 'dT_s3_fitted'] = ts.dT_spans[2]
+            if len(ts.dT_spans) == 3:
+                output_df.loc[i, 'dT_s1_fitted'] = ts.dT_spans[0]
+                output_df.loc[i, 'dT_s2_fitted'] = ts.dT_spans[1]
+                output_df.loc[i, 'dT_s3_fitted'] = ts.dT_spans[2]
+            else:
+                output_df.loc[i, 'dT_left_fitted'] = ts.dT_spans[0]
+                output_df.loc[i, 'dT_right_fitted'] = ts.dT_spans[1]
         
         # Optimizer residuals (from optimization process)
         for i in range(4):
