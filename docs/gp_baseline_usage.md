@@ -87,3 +87,38 @@ uv run python src/models/gp/svgp_baseline.py \
   --kernel rbf --ard --inducing 512 --inducing-init kmeans --noise-init 0.001 --jitter 1e-6 \
   --pca-variance 0.98 --seed 42 \
   --experiment-root experiments/svgp_smoketest --device cpu
+
+
+uv run python src/models/gp/mt_icm.py \
+  --train-csv data/d3d04_all_train_r.csv data/m2_0914_r_all_train.csv data/m2_lhs_0916_train.csv \
+  --test-csv  data/d3d04_all_test_r.csv  data/m2_0914_r_all_test.csv  data/m2_lhs_0916_test.csv \
+  --input-cols-re  '^F[1-6]$, ^N[0-9]+_r$, T_grad' \
+  --target-cols-re '^R[0-9]+$, ^Ry_t[0-9]+$, ^Rx_t[0-9]+$, D_t[0-9]+_r$' \
+  --icm-rank-grid 6,8,10 \
+  --noise-init-grid 5e-4,1e-3 \
+  --pca-variance-grid 0.97,0.985,0.99 \
+  --natgrad-lr 0.1 --lr-lmc 0.004 --lr-variational 0.003 \
+  --sweep-save-summary --sweep-tag icm_rank_pca_noise
+
+uv run python src/models/gp/mt_icm.py \
+    --train-csv data/d3d04_all_train_r.csv data/m2_0914_r_all_train.csv data/m2_lhs_0916_train.csv \
+    --test-csv  data/d3d04_all_test_r.csv  data/m2_0914_r_all_test.csv  data/m2_lhs_0916_test.csv \
+    --input-cols-re  '^F[1-6]$, ^N[0-9]+_r$, T_grad' \
+    --target-cols-re '^R[0-9]+$, ^Ry_t[0-9]+$, ^Rx_t[0-9]+$, D_t[0-9]+_r$' \
+    --icm-rank-grid 6,8,10 \
+    --noise-init-grid 5e-4,1e-3 \
+    --pca-variance-grid 0.97,0.985,0.99 \
+    --natgrad-lr 0.1 --lr-lmc 0.004 --lr-variational 0.003 \
+    --sweep-save-summary --sweep-tag icm_rank_pca_noise
+
+uv run python src/models/gp/mt_icm.py \
+    --train-csv data/d3d04_all_train_r.csv data/m2_0914_r_all_train.csv data/m2_lhs_0916_train.csv \
+    --test-csv  data/d3d04_all_test_r.csv  data/m2_0914_r_all_test.csv  data/m2_lhs_0916_test.csv \
+    --input-cols-re  '^F[1-6]$, ^N[0-9]+_r$, T_grad' \
+    --target-cols-re '^R[0-9]+$, ^Ry_t[0-9]+$, ^Rx_t[0-9]+$, D_t[0-9]+_r$' \
+    --epochs 300 --prewarm-epochs 25 \
+    --icm-rank-grid 12,16,20 \
+    --pca-components-grid 12,16,20 \
+    --noise-init-grid 5e-4,1e-3 \
+    --lr-variational 0.003 --lr-lmc 0.004 \
+    --sweep-save-summary --sweep-tag icm_rank_components 

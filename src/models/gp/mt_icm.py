@@ -751,14 +751,18 @@ def _train_model(
             optimizer.zero_grad(set_to_none=True)
             if natgrad_optimizer is not None:
                 natgrad_optimizer.zero_grad()
-        with gpytorch.settings.cholesky_jitter(model.extra_jitter()):
-            output = model(xb)
-            loss = -mll(output, yb)
-        loss.backward()
-        if natgrad_optimizer is not None:
-            if cfg.natgrad_clip is not None:
-                torch.nn.utils.clip_grad_norm_(variational_params, float(cfg.natgrad_clip))
-            natgrad_optimizer.step()
+
+            with gpytorch.settings.cholesky_jitter(model.extra_jitter()):
+                output = model(xb)
+                loss = -mll(output, yb)
+
+            loss.backward()
+
+            if natgrad_optimizer is not None:
+                if cfg.natgrad_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(variational_params, float(cfg.natgrad_clip))
+                natgrad_optimizer.step()
+
             optimizer.step()
 
             running_loss += loss.item()
@@ -1452,6 +1456,13 @@ def _run_sweep(cfg: CLIConfig) -> None:
     summaries: List[RunSummary] = []
     total_runs = 0
     stop_requested = False
+    total_variants = len(icm_values) * len(noise_values) * len(pca_axis)
+    max_runs = min(total_variants, int(cfg.sweep_max_runs)) if cfg.sweep_max_runs else total_variants
+    print(
+        "Starting sweep with "
+        f"{max_runs} planned run(s) "
+        f"(icm_rank={icm_values}, noise_init={noise_values}, pca_axis={[(mode, value) for mode, value in pca_axis]})"
+    )
 
     for icm_rank in icm_values:
         if stop_requested:
@@ -1480,6 +1491,24 @@ def _run_sweep(cfg: CLIConfig) -> None:
                 run_cfg.experiment_root = sweep_root
                 run_cfg.sweep_tag = cfg.sweep_tag
                 run_cfg.sweep_save_summary = cfg.sweep_save_summary
+
+                current_idx = total_runs + 1
+                if current_idx > max_runs and cfg.sweep_max_runs:
+                    stop_requested = True
+                    break
+
+                progress_msg = (
+                    f"[Sweep {current_idx}/{max_runs}] "
+                    f"icm_rank={run_cfg.icm_rank} "
+                    f"noise_init={run_cfg.noise_init:g} "
+                )
+                if pca_mode == "components":
+                    progress_msg += f"pca_components={run_cfg.pca_components}"
+                elif pca_mode == "variance":
+                    progress_msg += f"pca_variance={run_cfg.pca_variance}"
+                else:
+                    progress_msg += f"pca_components={run_cfg.pca_components} pca_variance={run_cfg.pca_variance}"
+                print(progress_msg)
 
                 summary = execute_run(run_cfg)
                 summaries.append(summary)
