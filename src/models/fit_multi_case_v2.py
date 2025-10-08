@@ -14,13 +14,19 @@ Usage:
         --data data/augmented/dt_24hours_data_4.csv \
         --max-samples 100 \
         --maxiter 500
+    
+    # Multiple files (will be concatenated with temporal smoothness across boundaries)
+    uv run python src/models/fit_multi_case_v2.py \
+        --data data/augmented/dt_24hours_data_new.csv \
+        --data data/augmented/dt_24hours_data_new2.csv \
+        --maxiter 500
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -37,13 +43,40 @@ from models.bridge_forward_model import (
 )
 
 
-def load_multi_case_data(csv_path: Path, max_samples: int | None = None) -> Tuple[pd.DataFrame, dict]:
-    """Load multi-case data and verify structural parameters are constant."""
-    df = pd.read_csv(csv_path)
+def load_multi_case_data(csv_paths: List[Path], max_samples: int | None = None) -> Tuple[pd.DataFrame, dict]:
+    """Load and concatenate multi-case data from multiple files.
+    
+    Args:
+        csv_paths: List of CSV file paths to load and concatenate
+        max_samples: Optional limit on total samples after concatenation
+    
+    Returns:
+        Combined DataFrame with continuous sample_id, and constant structural parameters
+    """
+    dfs = []
+    
+    print(f"\n加载 {len(csv_paths)} 个数据文件:")
+    for i, csv_path in enumerate(csv_paths):
+        df = pd.read_csv(csv_path)
+        print(f"  文件 {i+1}: {csv_path.name} ({len(df)} 条数据)")
+        dfs.append(df)
+    
+    # Concatenate all dataframes
+    df = pd.concat(dfs, ignore_index=True)
+    
+    # Concatenate all dataframes
+    df = pd.concat(dfs, ignore_index=True)
+    
+    # Reset sample_id to be continuous across all files
+    df['sample_id'] = range(len(df))
+    
+    print(f"\n合并后数据集:")
+    print(f"  总样本数: {len(df)}")
     
     if max_samples is not None and len(df) > max_samples:
         df = df.iloc[:max_samples].copy()
-        print(f"限制到前 {max_samples} 条数据")
+        df['sample_id'] = range(len(df))
+        print(f"  限制到前 {max_samples} 条数据")
     
     # Verify structural parameters are constant
     struct_cols = [
@@ -56,11 +89,9 @@ def load_multi_case_data(csv_path: Path, max_samples: int | None = None) -> Tupl
     for col in struct_cols:
         unique_vals = df[col].unique()
         if len(unique_vals) != 1:
-            print(f"警告: {col} 不是常数，有 {len(unique_vals)} 个不同值")
+            print(f"  警告: {col} 不是常数，有 {len(unique_vals)} 个不同值")
         const_params[col] = float(df[col].iloc[0])
     
-    print(f"\n数据集信息:")
-    print(f"  总样本数: {len(df)}")
     print(f"  结构参数验证: {'✓ 全部为常数' if all(len(df[c].unique()) == 1 for c in struct_cols) else '✗ 存在变化'}")
     
     return df, const_params
@@ -329,6 +360,8 @@ class VectorizedMultiCaseFitter:
         # 3. Vectorized temporal regularization
         if self.temp_temporal_weight > 0:
             # Compute differences between consecutive cases
+            # NOTE: This works across file boundaries when multiple files are concatenated,
+            # ensuring smooth temperature transitions throughout the entire time series
             # dT_matrix: (n_cases, 3), we want dT[i+1] - dT[i] for each span
             dT_diff = dT_matrix[1:, :] - dT_matrix[:-1, :]  # (n_cases-1, 3)
             
@@ -370,6 +403,7 @@ class VectorizedMultiCaseFitter:
             args=(fit_struct,),
             ftol=1e-8,
             gtol=1e-8,
+            xtol=1e-12,
             max_nfev=maxiter * 100,
             verbose=verbose,
         )
@@ -407,10 +441,11 @@ class VectorizedMultiCaseFitter:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="向量化优化版多工况拟合 (v2)"
+        description="向量化优化版多工况拟合 (v2) - 支持多文件输入"
     )
-    parser.add_argument('--data', type=Path, required=True, help='CSV数据文件')
-    parser.add_argument('--max-samples', type=int, help='限制样本数')
+    parser.add_argument('--data', type=Path, action='append', required=True, 
+                        help='CSV数据文件 (可多次指定以连接多个文件)')
+    parser.add_argument('--max-samples', type=int, help='限制样本数 (拼接后)')
     parser.add_argument('--no-fit-struct', action='store_true', help='不拟合结构参数')
     parser.add_argument('--maxiter', type=int, default=200, help='最大迭代次数')
     parser.add_argument('--temp-spatial-weight', type=float, default=1.0)
@@ -419,8 +454,10 @@ def main():
     
     args = parser.parse_args()
     
-    # Load data
-    print(f"加载数据: {args.data}")
+    # Load and concatenate data from multiple files
+    print(f"{'='*60}")
+    print("数据加载")
+    print(f"{'='*60}")
     df, const_params = load_multi_case_data(args.data, args.max_samples)
     
     reactions_matrix = df[['R_a_kN', 'R_b_kN', 'R_c_kN', 'R_d_kN']].to_numpy()
