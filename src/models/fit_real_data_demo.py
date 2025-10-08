@@ -251,15 +251,31 @@ def main():
     if config.fit_temperature or args.fit_all:
         print_comparison("Temperature (°C)", true_data["dT_spans"], result.fitted_thermal.dT_spans)
     
-    # Compare reactions
-    print_comparison("Reactions (kN)", true_data["reactions"], result.fitted_reactions)
-    
-    # Print summary statistics
+    # Verify reactions match (this should always be perfect)
     reaction_errors = result.fitted_reactions - true_data["reactions"]
-    print(f"\nReaction fit statistics:")
-    print(f"  RMSE:     {np.sqrt(np.mean(reaction_errors**2)):.4f} kN")
-    print(f"  Max err:  {np.max(np.abs(reaction_errors)):.4f} kN")
-    print(f"  Mean err: {np.mean(reaction_errors):.4f} kN")
+    print(f"\n反力验证（输入约束）:")
+    print(f"  测量值:   {true_data['reactions']}")
+    print(f"  拟合值:   {result.fitted_reactions}")
+    print(f"  RMSE:     {np.sqrt(np.mean(reaction_errors**2)):.6e} kN")
+    print(f"  最大误差: {np.max(np.abs(reaction_errors)):.6e} kN")
+    
+    # Print parameter fitting quality
+    n_fitted = sum([config.fit_settlements, config.fit_ei_factors, 
+                    config.fit_kv_factors, config.fit_temperature])
+    n_params = (4 if config.fit_settlements else 0) + \
+               (3 if config.fit_ei_factors else 0) + \
+               (4 if config.fit_kv_factors else 0) + \
+               (3 if config.fit_temperature else 0)
+    
+    print(f"\n问题规模:")
+    print(f"  约束方程数（反力）: 4")
+    print(f"  待拟合参数数:       {n_params}")
+    print(f"  问题类型:           {'欠定问题' if n_params > 4 else '适定问题' if n_params == 4 else '超定问题'}")
+    
+    if n_params > 4:
+        print(f"\n⚠️  注意：这是欠定问题（{n_params}个未知数，4个方程）")
+        print(f"    存在无穷多组参数能产生相同的反力")
+        print(f"    拟合出的参数可能与真实值差异较大，但仍能重现反力")
     
 
 if __name__ == "__main__":
