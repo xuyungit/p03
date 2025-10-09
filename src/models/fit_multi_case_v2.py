@@ -83,12 +83,14 @@ class MeasurementConfig:
         use_rotations: Use support rotations (theta_A, theta_B, theta_C, theta_D)
         displacement_weight: Weight for displacement residuals relative to reactions
         rotation_weight: Weight for rotation residuals relative to reactions
+        auto_normalize: Automatically normalize residuals by measurement std (recommended)
     """
     use_reactions: bool = True
     use_displacements: bool = False
     use_rotations: bool = False
     displacement_weight: float = 1.0
     rotation_weight: float = 1.0
+    auto_normalize: bool = True  # 自动归一化（推荐）
     
     def __post_init__(self):
         if not any([self.use_reactions, self.use_displacements, self.use_rotations]):
@@ -114,6 +116,10 @@ class MeasurementConfig:
             parts.append(f"位移(4, 权重={self.displacement_weight})")
         if self.use_rotations:
             parts.append(f"转角(4, 权重={self.rotation_weight})")
+        
+        if self.auto_normalize:
+            parts.append("自动归一化")
+        
         return " + ".join(parts)
 
 
@@ -353,6 +359,25 @@ class VectorizedMultiCaseFitter:
         if measurement_config.use_rotations and rotations_matrix is None:
             raise ValueError("rotations_matrix required when use_rotations=True")
         
+        # Compute normalization scales (standard deviations) for auto-normalization
+        self.reaction_scale = np.std(reactions_matrix) if measurement_config.auto_normalize else 1.0
+        self.displacement_scale = (
+            np.std(displacements_matrix) if (measurement_config.auto_normalize and displacements_matrix is not None) 
+            else 1.0
+        )
+        self.rotation_scale = (
+            np.std(rotations_matrix) if (measurement_config.auto_normalize and rotations_matrix is not None) 
+            else 1.0
+        )
+        
+        # Avoid division by zero
+        if self.reaction_scale < 1e-10:
+            self.reaction_scale = 1.0
+        if self.displacement_scale < 1e-10:
+            self.displacement_scale = 1.0
+        if self.rotation_scale < 1e-10:
+            self.rotation_scale = 1.0
+        
         # Cache
         self._cached_system: StructuralSystem | None = None
         self._cached_struct_params: tuple | None = None
@@ -371,6 +396,7 @@ class VectorizedMultiCaseFitter:
         
         kv_status = f"固定为 {fixed_kv_factors}" if fixed_kv_factors else "参与拟合"
         settlement_status = "Settlement_A 固定为 0.0（参考点）" if fix_first_settlement else "全部拟合"
+        
         print(f"\n多工况拟合设置 (向量化版本 v2):")
         print(f"  工况数量: {self.n_cases}")
         print(f"  每工况约束: {n_measurements} ({measurement_config.describe()})")
@@ -378,6 +404,15 @@ class VectorizedMultiCaseFitter:
         print(f"  KV参数: {kv_status}")
         print(f"  沉降参数: {settlement_status}")
         print(f"  优化特性: 批量求解 + 向量化温度载荷 (nT={self.temp_segments})")
+        
+        if measurement_config.auto_normalize:
+            print(f"\n归一化标度 (基于测量数据的标准差):")
+            if measurement_config.use_reactions:
+                print(f"  反力:   {self.reaction_scale:.6e}")
+            if measurement_config.use_displacements:
+                print(f"  位移:   {self.displacement_scale:.6e}")
+            if measurement_config.use_rotations:
+                print(f"  转角:   {self.rotation_scale:.6e}")
     
     def _build_x0_and_bounds(
         self,
@@ -403,8 +438,8 @@ class VectorizedMultiCaseFitter:
             
             # EI factors (3)
             x0_list.extend([1.0, 1.0, 1.0])
-            lower_list.extend([0.1] * 3)
-            upper_list.extend([2.0] * 3)
+            lower_list.extend([0.3] * 3)
+            upper_list.extend([1.5] * 3)
             
             # Kv factors (4) - only if not fixed
             if self.fixed_kv_factors is None:
@@ -510,7 +545,7 @@ class VectorizedMultiCaseFitter:
         x: np.ndarray,
         fit_struct: bool = True,
     ) -> np.ndarray:
-        """Vectorized residual computation."""
+        """Vectorized residual computation with auto-normalization."""
         self._n_residual_calls += 1
         
         struct_params, dT_matrix = self._unpack_params(x, fit_struct)
@@ -520,20 +555,25 @@ class VectorizedMultiCaseFitter:
         _, reactions_all, displacements_all, rotations_all = batch_solve_with_system(system, dT_matrix)
         
         # Build physics residuals based on measurement configuration
+        # Apply normalization by std and user-specified weights
         residuals_list = []
         
         if self.measurement_config.use_reactions:
             reaction_residuals = (reactions_all - self.reactions_matrix).ravel()
+            # Normalize by std (if auto_normalize) then apply user weight
+            reaction_residuals = reaction_residuals / self.reaction_scale
             residuals_list.append(reaction_residuals)
         
         if self.measurement_config.use_displacements:
             displacement_residuals = (displacements_all - self.displacements_matrix).ravel()
-            displacement_residuals *= self.measurement_config.displacement_weight
+            # Normalize by std (if auto_normalize) then apply user weight
+            displacement_residuals = (displacement_residuals / self.displacement_scale) * self.measurement_config.displacement_weight
             residuals_list.append(displacement_residuals)
         
         if self.measurement_config.use_rotations:
             rotation_residuals = (rotations_all - self.rotations_matrix).ravel()
-            rotation_residuals *= self.measurement_config.rotation_weight
+            # Normalize by std (if auto_normalize) then apply user weight
+            rotation_residuals = (rotation_residuals / self.rotation_scale) * self.measurement_config.rotation_weight
             residuals_list.append(rotation_residuals)
         
         physics_residuals = np.concatenate(residuals_list)
@@ -665,9 +705,11 @@ def main():
     parser.add_argument('--use-rotations', action='store_true',
                         help='使用支座转角测量值 (theta_A, theta_B, theta_C, theta_D)')
     parser.add_argument('--displacement-weight', type=float, default=1.0,
-                        help='位移残差权重 (相对于反力)')
+                        help='位移残差权重 (相对于反力，默认1.0)')
     parser.add_argument('--rotation-weight', type=float, default=1.0,
-                        help='转角残差权重 (相对于反力)')
+                        help='转角残差权重 (相对于反力，默认1.0)')
+    parser.add_argument('--no-auto-normalize', action='store_true',
+                        help='禁用自动归一化（默认启用，基于测量数据标准差归一化）')
     
     args = parser.parse_args()
     
@@ -683,6 +725,7 @@ def main():
         use_rotations=args.use_rotations,
         displacement_weight=args.displacement_weight,
         rotation_weight=args.rotation_weight,
+        auto_normalize=not args.no_auto_normalize,  # Default: enabled
     )
     
     df, const_params, detected_config = load_multi_case_data(
