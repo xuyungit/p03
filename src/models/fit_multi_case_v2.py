@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Further optimized multi-case fitting with vectorized operations.
+"""Further optimized multi-case fitting with vectorized operations and flexible measurements.
 
 Additional optimizations over fit_multi_case_optimized.py:
 1. Batch thermal load computation - vectorize temperature load vectors
 2. Batch solve - solve all cases simultaneously using BLAS Level 3
 3. Vectorized regularization computation
 4. Pre-allocate arrays to reduce memory allocations
+5. Support for multiple measurement types (reactions, displacements, rotations)
 
 Expected performance improvement: 1.5-2x over fit_multi_case_optimized.py
 
 Usage:
-    # Basic usage (默认固定 settlement_a = 0.0 作为参考点)
+    # Basic usage (默认固定 settlement_a = 0.0 作为参考点，仅使用反力)
     uv run python src/models/fit_multi_case_v2.py \
         --data data/augmented/dt_24hours_data_4.csv \
         --max-samples 100 \
@@ -33,13 +34,29 @@ Usage:
         --data data/augmented/dt_24hours_data_4.csv \
         --no-fix-first-settlement \
         --maxiter 500
+    
+    # 使用位移和转角测量值（权重可调）
+    uv run python src/models/fit_multi_case_v2.py \
+        --data data/augmented/dt_24hours_data_new2.csv \
+        --use-displacements \
+        --use-rotations \
+        --displacement-weight 10.0 \
+        --rotation-weight 1000.0 \
+        --maxiter 500
+    
+    # 仅使用位移（不使用反力和转角）
+    uv run python src/models/fit_multi_case_v2.py \
+        --data data/augmented/dt_24hours_data_new2.csv \
+        --use-displacements \
+        --maxiter 500
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -56,15 +73,64 @@ from models.bridge_forward_model import (
 )
 
 
-def load_multi_case_data(csv_paths: List[Path], max_samples: int | None = None) -> Tuple[pd.DataFrame, dict]:
+@dataclass
+class MeasurementConfig:
+    """Configuration for which measurements to use in fitting.
+    
+    Attributes:
+        use_reactions: Use support reactions (R_a, R_b, R_c, R_d)
+        use_displacements: Use support vertical displacements (v_A, v_B, v_C, v_D)
+        use_rotations: Use support rotations (theta_A, theta_B, theta_C, theta_D)
+        displacement_weight: Weight for displacement residuals relative to reactions
+        rotation_weight: Weight for rotation residuals relative to reactions
+    """
+    use_reactions: bool = True
+    use_displacements: bool = False
+    use_rotations: bool = False
+    displacement_weight: float = 1.0
+    rotation_weight: float = 1.0
+    
+    def __post_init__(self):
+        if not any([self.use_reactions, self.use_displacements, self.use_rotations]):
+            raise ValueError("At least one measurement type must be enabled")
+    
+    def count_measurements_per_case(self) -> int:
+        """Count number of measurements per case."""
+        count = 0
+        if self.use_reactions:
+            count += 4  # 4 support reactions
+        if self.use_displacements:
+            count += 4  # 4 support displacements
+        if self.use_rotations:
+            count += 4  # 4 support rotations
+        return count
+    
+    def describe(self) -> str:
+        """Return human-readable description."""
+        parts = []
+        if self.use_reactions:
+            parts.append("反力(4)")
+        if self.use_displacements:
+            parts.append(f"位移(4, 权重={self.displacement_weight})")
+        if self.use_rotations:
+            parts.append(f"转角(4, 权重={self.rotation_weight})")
+        return " + ".join(parts)
+
+
+def load_multi_case_data(
+    csv_paths: List[Path], 
+    max_samples: int | None = None,
+    measurement_config: Optional[MeasurementConfig] = None,
+) -> Tuple[pd.DataFrame, dict, MeasurementConfig]:
     """Load and concatenate multi-case data from multiple files.
     
     Args:
         csv_paths: List of CSV file paths to load and concatenate
         max_samples: Optional limit on total samples after concatenation
+        measurement_config: Optional measurement configuration. If None, auto-detect from data.
     
     Returns:
-        Combined DataFrame with continuous sample_id, and constant structural parameters
+        Combined DataFrame, constant structural parameters, and measurement configuration
     """
     dfs = []
     
@@ -88,6 +154,29 @@ def load_multi_case_data(csv_paths: List[Path], max_samples: int | None = None) 
         df['sample_id'] = range(len(df))
         print(f"  限制到前 {max_samples} 条数据")
     
+    # Auto-detect available measurements if config not provided
+    if measurement_config is None:
+        reaction_cols = ['R_a_kN', 'R_b_kN', 'R_c_kN', 'R_d_kN']
+        displacement_cols = ['v_A_mm', 'v_B_mm', 'v_C_mm', 'v_D_mm']
+        rotation_cols = ['theta_A_rad', 'theta_B_rad', 'theta_C_rad', 'theta_D_rad']
+        
+        has_reactions = all(col in df.columns for col in reaction_cols)
+        has_displacements = all(col in df.columns for col in displacement_cols)
+        has_rotations = all(col in df.columns for col in rotation_cols)
+        
+        print(f"\n可用测量数据:")
+        print(f"  反力 (R_a~R_d): {'✓' if has_reactions else '✗'}")
+        print(f"  位移 (v_A~v_D): {'✓' if has_displacements else '✗'}")
+        print(f"  转角 (theta_A~theta_D): {'✓' if has_rotations else '✗'}")
+        
+        # Default: use only reactions
+        measurement_config = MeasurementConfig(
+            use_reactions=has_reactions,
+            use_displacements=False,
+            use_rotations=False,
+        )
+        print(f"\n默认使用: 仅反力")
+    
     # Verify structural parameters are constant
     struct_cols = [
         'settlement_a_mm', 'settlement_b_mm', 'settlement_c_mm', 'settlement_d_mm',
@@ -104,7 +193,7 @@ def load_multi_case_data(csv_paths: List[Path], max_samples: int | None = None) 
     
     print(f"  结构参数验证: {'✓ 全部为常数' if all(len(df[c].unique()) == 1 for c in struct_cols) else '✗ 存在变化'}")
     
-    return df, const_params
+    return df, const_params, measurement_config
 
 
 def f_thermal_element(ei: float, kappa: float) -> np.ndarray:
@@ -161,7 +250,7 @@ def batch_thermal_load_vectors(
 def batch_solve_with_system(
     system: StructuralSystem,
     dT_matrix: np.ndarray,  # shape: (n_cases, 2 or 3)
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Batch solve for all cases simultaneously.
     
     Args:
@@ -171,6 +260,8 @@ def batch_solve_with_system(
     Returns:
         U_all: Displacements, shape (n_cases, ndof)
         reactions_all: Reactions, shape (n_cases, 4)
+        displacements_all: Support vertical displacements, shape (n_cases, 4)
+        rotations_all: Support rotations, shape (n_cases, 4)
     """
     n_cases = dT_matrix.shape[0]
     
@@ -184,13 +275,24 @@ def batch_solve_with_system(
     # lu_solve accepts (ndof, n_cases) format
     U_all = lu_solve((system.lu, system.piv), F_all.T).T  # shape: (n_cases, ndof)
     
-    # Extract reactions for all cases
+    # Extract reactions, displacements, and rotations for all cases
     reactions_all = np.zeros((n_cases, 4), dtype=float)
+    displacements_all = np.zeros((n_cases, 4), dtype=float)
+    rotations_all = np.zeros((n_cases, 4), dtype=float)
+    
     for i, idx in enumerate(system.support_nodes):
-        ui_all = U_all[:, 2 * idx]  # vertical displacements at support
+        # Vertical displacement at support
+        ui_all = U_all[:, 2 * idx]
+        displacements_all[:, i] = ui_all
+        
+        # Rotation at support
+        theta_all = U_all[:, 2 * idx + 1]
+        rotations_all[:, i] = theta_all
+        
+        # Reaction force
         reactions_all[:, i] = -system.kv_values[i] * (ui_all - system.settlements[i]) / 1_000.0
     
-    return U_all, reactions_all
+    return U_all, reactions_all, displacements_all, rotations_all
 
 
 class VectorizedMultiCaseFitter:
@@ -206,6 +308,9 @@ class VectorizedMultiCaseFitter:
         fixed_kv_factors: tuple[float, float, float, float] | None = None,
         fix_first_settlement: bool = True,
         temp_segments: int = 3,
+        measurement_config: Optional[MeasurementConfig] = None,
+        displacements_matrix: Optional[np.ndarray] = None,  # shape: (n_cases, 4)
+        rotations_matrix: Optional[np.ndarray] = None,  # shape: (n_cases, 4)
     ):
         """
         Args:
@@ -216,6 +321,10 @@ class VectorizedMultiCaseFitter:
             temp_temporal_weight: Weight for temporal temperature smoothness
             fixed_kv_factors: If provided, use these fixed KV values instead of fitting
             fix_first_settlement: If True, fix settlement_a to 0.0 as reference (default: True)
+            temp_segments: Number of temperature segments (2 or 3)
+            measurement_config: Configuration for which measurements to use
+            displacements_matrix: Measured displacements, shape (n_cases, 4) if using
+            rotations_matrix: Measured rotations, shape (n_cases, 4) if using
         """
         self.reactions_matrix = reactions_matrix
         self.n_cases = reactions_matrix.shape[0]
@@ -229,9 +338,28 @@ class VectorizedMultiCaseFitter:
             raise ValueError("temp_segments must be 2 or 3")
         self.temp_segments = temp_segments
         
+        # Measurement configuration
+        if measurement_config is None:
+            measurement_config = MeasurementConfig(use_reactions=True)
+        self.measurement_config = measurement_config
+        
+        # Store measurement matrices
+        self.displacements_matrix = displacements_matrix
+        self.rotations_matrix = rotations_matrix
+        
+        # Validate measurement configuration
+        if measurement_config.use_displacements and displacements_matrix is None:
+            raise ValueError("displacements_matrix required when use_displacements=True")
+        if measurement_config.use_rotations and rotations_matrix is None:
+            raise ValueError("rotations_matrix required when use_rotations=True")
+        
         # Cache
         self._cached_system: StructuralSystem | None = None
         self._cached_struct_params: tuple | None = None
+        
+        # Pre-allocate arrays for physics residuals
+        n_measurements = measurement_config.count_measurements_per_case()
+        self._physics_residuals = np.zeros(self.n_cases * n_measurements, dtype=float)
         
         # Pre-allocate arrays for regularization (sizes depend on temp_segments)
         self._spatial_residuals = np.zeros(self.n_cases * max(0, self.temp_segments - 1), dtype=float)
@@ -245,8 +373,8 @@ class VectorizedMultiCaseFitter:
         settlement_status = "Settlement_A 固定为 0.0（参考点）" if fix_first_settlement else "全部拟合"
         print(f"\n多工况拟合设置 (向量化版本 v2):")
         print(f"  工况数量: {self.n_cases}")
-        print(f"  每工况约束: 4 (反力)")
-        print(f"  总约束数: {self.n_cases * 4}")
+        print(f"  每工况约束: {n_measurements} ({measurement_config.describe()})")
+        print(f"  总约束数: {self.n_cases * n_measurements}")
         print(f"  KV参数: {kv_status}")
         print(f"  沉降参数: {settlement_status}")
         print(f"  优化特性: 批量求解 + 向量化温度载荷 (nT={self.temp_segments})")
@@ -388,10 +516,27 @@ class VectorizedMultiCaseFitter:
         struct_params, dT_matrix = self._unpack_params(x, fit_struct)
         system = self._get_or_assemble_system(struct_params)
         
-        # 1. Reactions residuals (batch for both 2- and 3-segment modes)
-        _, reactions_all = batch_solve_with_system(system, dT_matrix)
-
-        physics_residuals = (reactions_all - self.reactions_matrix).ravel()
+        # 1. Physics residuals - compute all responses
+        _, reactions_all, displacements_all, rotations_all = batch_solve_with_system(system, dT_matrix)
+        
+        # Build physics residuals based on measurement configuration
+        residuals_list = []
+        
+        if self.measurement_config.use_reactions:
+            reaction_residuals = (reactions_all - self.reactions_matrix).ravel()
+            residuals_list.append(reaction_residuals)
+        
+        if self.measurement_config.use_displacements:
+            displacement_residuals = (displacements_all - self.displacements_matrix).ravel()
+            displacement_residuals *= self.measurement_config.displacement_weight
+            residuals_list.append(displacement_residuals)
+        
+        if self.measurement_config.use_rotations:
+            rotation_residuals = (rotations_all - self.rotations_matrix).ravel()
+            rotation_residuals *= self.measurement_config.rotation_weight
+            residuals_list.append(rotation_residuals)
+        
+        physics_residuals = np.concatenate(residuals_list)
 
         # 2. Spatial regularization
         temp_spatial_diff_thresh = 3.0
@@ -460,10 +605,14 @@ class VectorizedMultiCaseFitter:
         # Convert dT_matrix back to ThermalState list for compatibility
         thermal_states = [ThermalState(dT_spans=tuple(row)) for row in dT_matrix]  # type: ignore[arg-type]
         
-        # Compute final residuals
-        all_residuals = self._residual(result.x, fit_struct)
-        n_physics = self.n_cases * 4
-        physics_residuals = all_residuals[:n_physics].reshape(self.n_cases, 4)
+        # Compute final residuals by measurement type
+        _, reactions_all, displacements_all, rotations_all = batch_solve_with_system(
+            self._get_or_assemble_system(struct_params), dT_matrix
+        )
+        
+        reaction_residuals = reactions_all - self.reactions_matrix if self.measurement_config.use_reactions else None
+        displacement_residuals = displacements_all - self.displacements_matrix if self.measurement_config.use_displacements else None
+        rotation_residuals = rotations_all - self.rotations_matrix if self.measurement_config.use_rotations else None
         
         print(f"\n性能统计:")
         print(f"  残差函数调用次数: {self._n_residual_calls}")
@@ -476,7 +625,12 @@ class VectorizedMultiCaseFitter:
             'message': result.message,
             'struct_params': struct_params,
             'thermal_states': thermal_states,
-            'residuals': physics_residuals,
+            'reaction_residuals': reaction_residuals,
+            'displacement_residuals': displacement_residuals,
+            'rotation_residuals': rotation_residuals,
+            'reactions_computed': reactions_all,
+            'displacements_computed': displacements_all,
+            'rotations_computed': rotations_all,
             'cost': result.cost,
             'optimality': result.optimality,
             'nfev': result.nfev,
@@ -488,7 +642,7 @@ class VectorizedMultiCaseFitter:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="向量化优化版多工况拟合 (v2) - 支持多文件输入"
+        description="向量化优化版多工况拟合 (v2) - 支持多文件输入和多种测量类型"
     )
     parser.add_argument('--data', type=Path, action='append', required=True, 
                         help='CSV数据文件 (可多次指定以连接多个文件)')
@@ -505,15 +659,59 @@ def main():
     parser.add_argument('--temp-segments', type=int, default=3, choices=[2, 3],
                         help='温度分段数：3=每跨；2=按全长50/50')
     
+    # Measurement configuration
+    parser.add_argument('--use-displacements', action='store_true',
+                        help='使用支座位移测量值 (v_A, v_B, v_C, v_D)')
+    parser.add_argument('--use-rotations', action='store_true',
+                        help='使用支座转角测量值 (theta_A, theta_B, theta_C, theta_D)')
+    parser.add_argument('--displacement-weight', type=float, default=1.0,
+                        help='位移残差权重 (相对于反力)')
+    parser.add_argument('--rotation-weight', type=float, default=1.0,
+                        help='转角残差权重 (相对于反力)')
+    
     args = parser.parse_args()
     
     # Load and concatenate data from multiple files
     print(f"{'='*60}")
     print("数据加载")
     print(f"{'='*60}")
-    df, const_params = load_multi_case_data(args.data, args.max_samples)
     
+    # Create measurement configuration from command line args
+    measurement_config = MeasurementConfig(
+        use_reactions=True,  # Always use reactions
+        use_displacements=args.use_displacements,
+        use_rotations=args.use_rotations,
+        displacement_weight=args.displacement_weight,
+        rotation_weight=args.rotation_weight,
+    )
+    
+    df, const_params, detected_config = load_multi_case_data(
+        args.data, args.max_samples, measurement_config
+    )
+    
+    # Extract measurement matrices based on what's available and requested
     reactions_matrix = df[['R_a_kN', 'R_b_kN', 'R_c_kN', 'R_d_kN']].to_numpy()
+    
+    displacements_matrix = None
+    if measurement_config.use_displacements:
+        disp_cols = ['v_A_mm', 'v_B_mm', 'v_C_mm', 'v_D_mm']
+        if all(col in df.columns for col in disp_cols):
+            displacements_matrix = df[disp_cols].to_numpy()
+            print(f"\n✓ 使用支座位移测量值 (权重={measurement_config.displacement_weight})")
+        else:
+            print(f"\n✗ 警告: 请求使用位移但数据中不包含，将跳过位移约束")
+            measurement_config.use_displacements = False
+    
+    rotations_matrix = None
+    if measurement_config.use_rotations:
+        rot_cols = ['theta_A_rad', 'theta_B_rad', 'theta_C_rad', 'theta_D_rad']
+        if all(col in df.columns for col in rot_cols):
+            rotations_matrix = df[rot_cols].to_numpy()
+            print(f"\n✓ 使用支座转角测量值 (权重={measurement_config.rotation_weight})")
+        else:
+            print(f"\n✗ 警告: 请求使用转角但数据中不包含，将跳过转角约束")
+            measurement_config.use_rotations = False
+    
     # Temperature columns detection
     requested_segments = int(args.temp_segments)
     cols3 = ['dT_s1_C', 'dT_s2_C', 'dT_s3_C']
@@ -558,6 +756,9 @@ def main():
         fixed_kv_factors=fixed_kv_factors,
         fix_first_settlement=fix_first_settlement,
         temp_segments=actual_segments,
+        measurement_config=measurement_config,
+        displacements_matrix=displacements_matrix,
+        rotations_matrix=rotations_matrix,
     )
     
     # Fit
@@ -626,12 +827,29 @@ def main():
     print(f"  EI factors RMSE:  {np.sqrt(np.mean((fitted_ei - true_ei)**2)):.6f}")
     print(f"  Kv factors RMSE:  {np.sqrt(np.mean((fitted_kv - true_kv)**2)):.6f}")
     
-    # Residuals
-    residuals = result['residuals']
-    print(f"\n反力残差统计 ({len(residuals)} 工况):")
-    print(f"  全局 RMSE: {np.sqrt(np.mean(residuals**2)):.6e} kN")
-    print(f"  最大残差:  {np.max(np.abs(residuals)):.6e} kN")
-    print(f"  平均残差:  {np.mean(np.abs(residuals)):.6e} kN")
+    # Residuals by measurement type
+    print(f"\n残差统计 ({len(result['thermal_states'])} 工况):")
+    
+    if result['reaction_residuals'] is not None:
+        reaction_res = result['reaction_residuals']
+        print(f"\n  反力残差:")
+        print(f"    RMSE:     {np.sqrt(np.mean(reaction_res**2)):.6e} kN")
+        print(f"    最大残差: {np.max(np.abs(reaction_res)):.6e} kN")
+        print(f"    平均残差: {np.mean(np.abs(reaction_res)):.6e} kN")
+    
+    if result['displacement_residuals'] is not None:
+        disp_res = result['displacement_residuals']
+        print(f"\n  位移残差:")
+        print(f"    RMSE:     {np.sqrt(np.mean(disp_res**2)):.6e} mm")
+        print(f"    最大残差: {np.max(np.abs(disp_res)):.6e} mm")
+        print(f"    平均残差: {np.mean(np.abs(disp_res)):.6e} mm")
+    
+    if result['rotation_residuals'] is not None:
+        rot_res = result['rotation_residuals']
+        print(f"\n  转角残差:")
+        print(f"    RMSE:     {np.sqrt(np.mean(rot_res**2)):.6e} rad")
+        print(f"    最大残差: {np.max(np.abs(rot_res)):.6e} rad")
+        print(f"    平均残差: {np.mean(np.abs(rot_res)):.6e} rad")
     
     # Temperature examples
     print(f"\n温度梯度示例 (前5个工况):")
@@ -649,42 +867,57 @@ def main():
             print(f"    真实: {true_temps[i]}")
             print(f"    拟合: {fitted_dT}")
     
-    # Forward verification: recompute reactions using fitted parameters
+    # Forward verification: recompute all responses using fitted parameters
     print(f"\n{'='*60}")
-    print("正模型验算 - 使用拟合参数重新计算反力")
+    print("正模型验算 - 使用拟合参数重新计算所有响应")
     print(f"{'='*60}")
     
     # Assemble system with fitted structural parameters
     fitted_system = assemble_structural_system(result['struct_params'])
     
-    # Extract fitted temperature matrix and recompute reactions
+    # Extract fitted temperature matrix and recompute all responses
     fitted_dT_matrix = np.array([ts.dT_spans for ts in result['thermal_states']])
-    _, recomputed_reactions = batch_solve_with_system(fitted_system, fitted_dT_matrix)
+    _, recomputed_reactions, recomputed_displacements, recomputed_rotations = batch_solve_with_system(
+        fitted_system, fitted_dT_matrix
+    )
     
-    # Compare with observed reactions
-    forward_residuals = recomputed_reactions - reactions_matrix
+    # Compare with observed measurements
+    print(f"\n正模型验算残差:")
     
-    print(f"\n正模型验算残差统计:")
-    print(f"  RMSE: {np.sqrt(np.mean(forward_residuals**2)):.6e} kN")
-    print(f"  最大残差: {np.max(np.abs(forward_residuals)):.6e} kN")
-    print(f"  平均残差: {np.mean(np.abs(forward_residuals)):.6e} kN")
+    reaction_forward_res = recomputed_reactions - reactions_matrix
+    print(f"  反力:")
+    print(f"    RMSE:     {np.sqrt(np.mean(reaction_forward_res**2)):.6e} kN")
+    print(f"    最大残差: {np.max(np.abs(reaction_forward_res)):.6e} kN")
     
-    # Compare optimizer residuals vs forward residuals
-    optimizer_rmse = np.sqrt(np.mean(residuals**2))
-    forward_rmse = np.sqrt(np.mean(forward_residuals**2))
+    if displacements_matrix is not None:
+        disp_forward_res = recomputed_displacements - displacements_matrix
+        print(f"  位移:")
+        print(f"    RMSE:     {np.sqrt(np.mean(disp_forward_res**2)):.6e} mm")
+        print(f"    最大残差: {np.max(np.abs(disp_forward_res)):.6e} mm")
     
-    print(f"\n残差对比:")
-    print(f"  优化器残差 RMSE: {optimizer_rmse:.6e} kN")
-    print(f"  正模型残差 RMSE: {forward_rmse:.6e} kN")
-    print(f"  差异: {abs(optimizer_rmse - forward_rmse):.6e} kN")
+    if rotations_matrix is not None:
+        rot_forward_res = recomputed_rotations - rotations_matrix
+        print(f"  转角:")
+        print(f"    RMSE:     {np.sqrt(np.mean(rot_forward_res**2)):.6e} rad")
+        print(f"    最大残差: {np.max(np.abs(rot_forward_res)):.6e} rad")
     
-    if abs(optimizer_rmse - forward_rmse) > 1e-6:
-        print(f"  ⚠️  警告: 优化器残差与正模型残差存在显著差异，可能存在数值问题")
-    else:
-        print(f"  ✓ 优化器残差与正模型残差一致，验算通过")
+    # Compare optimizer residuals vs forward residuals for reactions
+    if result['reaction_residuals'] is not None:
+        optimizer_rmse = np.sqrt(np.mean(result['reaction_residuals']**2))
+        forward_rmse = np.sqrt(np.mean(reaction_forward_res**2))
+        
+        print(f"\n反力残差对比:")
+        print(f"  优化器残差 RMSE: {optimizer_rmse:.6e} kN")
+        print(f"  正模型残差 RMSE: {forward_rmse:.6e} kN")
+        print(f"  差异: {abs(optimizer_rmse - forward_rmse):.6e} kN")
+        
+        if abs(optimizer_rmse - forward_rmse) > 1e-6:
+            print(f"  ⚠️  警告: 优化器残差与正模型残差存在显著差异，可能存在数值问题")
+        else:
+            print(f"  ✓ 优化器残差与正模型残差一致，验算通过")
     
     # Show detailed comparison for first few cases
-    print(f"\n前5个工况的详细对比:")
+    print(f"\n前5个工况的反力详细对比:")
     print(f"  {'Case':<6} {'Support':<8} {'Observed':>12} {'Recomputed':>12} {'Residual':>12}")
     print(f"  {'-'*60}")
     support_names = ['A', 'B', 'C', 'D']
@@ -692,7 +925,7 @@ def main():
         for j, name in enumerate(support_names):
             obs = reactions_matrix[i, j]
             rec = recomputed_reactions[i, j]
-            res = forward_residuals[i, j]
+            res = reaction_forward_res[i, j]
             print(f"  {i:<6} {name:<8} {obs:>12.6f} {rec:>12.6f} {res:>12.6e}")
     
     # Save results
@@ -722,27 +955,48 @@ def main():
                 output_df.loc[i, 'dT_left_fitted'] = ts.dT_spans[0]
                 output_df.loc[i, 'dT_right_fitted'] = ts.dT_spans[1]
         
-        # Optimizer residuals (from optimization process)
-        for i in range(4):
-            output_df[f'residual_optimizer_R{i+1}'] = residuals[:, i]
-        
-        # Forward model verification: recomputed reactions
+        # Recomputed responses
         support_names = ['a', 'b', 'c', 'd']
         for i, name in enumerate(support_names):
             output_df[f'R_{name}_recomputed_kN'] = recomputed_reactions[:, i]
+            output_df[f'v_{name.upper()}_recomputed_mm'] = recomputed_displacements[:, i]
+            output_df[f'theta_{name.upper()}_recomputed_rad'] = recomputed_rotations[:, i]
         
-        # Forward model residuals (observed - recomputed)
+        # Optimizer residuals
+        if result['reaction_residuals'] is not None:
+            for i in range(4):
+                output_df[f'residual_optimizer_R{i+1}'] = result['reaction_residuals'][:, i]
+        
+        if result['displacement_residuals'] is not None:
+            for i in range(4):
+                output_df[f'residual_optimizer_v{i+1}'] = result['displacement_residuals'][:, i]
+        
+        if result['rotation_residuals'] is not None:
+            for i in range(4):
+                output_df[f'residual_optimizer_theta{i+1}'] = result['rotation_residuals'][:, i]
+        
+        # Forward model residuals
         for i in range(4):
-            output_df[f'residual_forward_R{i+1}'] = forward_residuals[:, i]
+            output_df[f'residual_forward_R{i+1}'] = reaction_forward_res[:, i]
+        
+        if displacements_matrix is not None:
+            disp_forward_res = recomputed_displacements - displacements_matrix
+            for i in range(4):
+                output_df[f'residual_forward_v{i+1}'] = disp_forward_res[:, i]
+        
+        if rotations_matrix is not None:
+            rot_forward_res = recomputed_rotations - rotations_matrix
+            for i in range(4):
+                output_df[f'residual_forward_theta{i+1}'] = rot_forward_res[:, i]
         
         output_df.to_csv(args.output, index=False)
         print(f"\n结果已保存到: {args.output}")
         print(f"\n输出文件包含:")
         print(f"  - 拟合的结构参数 (11个)")
-        print(f"  - 拟合的温度参数 (每工况3个)")
-        print(f"  - 优化器残差 (4个反力残差)")
-        print(f"  - 正模型重算的反力 (4个)")
-        print(f"  - 正模型残差 (4个，用于验证多解)")
+        print(f"  - 拟合的温度参数 (每工况 {actual_segments} 个)")
+        print(f"  - 正模型重算的响应 (反力、位移、转角)")
+        print(f"  - 优化器残差 ({measurement_config.describe()})")
+        print(f"  - 正模型残差 (用于验证)")
 
 
 if __name__ == '__main__':
