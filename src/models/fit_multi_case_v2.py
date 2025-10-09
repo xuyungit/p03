@@ -394,26 +394,28 @@ class VectorizedMultiCaseFitter:
         physics_residuals = (reactions_all - self.reactions_matrix).ravel()
 
         # 2. Spatial regularization
+        temp_spatial_diff_thresh = 3.0
         if self.temp_spatial_weight > 0:
             if self.temp_segments == 3:
                 diff_01 = dT_matrix[:, 1] - dT_matrix[:, 0]
                 diff_12 = dT_matrix[:, 2] - dT_matrix[:, 1]
-                spatial_penalty_01 = np.maximum(0.0, np.abs(diff_01) - 5.0) * self.temp_spatial_weight
-                spatial_penalty_12 = np.maximum(0.0, np.abs(diff_12) - 5.0) * self.temp_spatial_weight
+                spatial_penalty_01 = np.maximum(0.0, np.abs(diff_01) - temp_spatial_diff_thresh) * self.temp_spatial_weight
+                spatial_penalty_12 = np.maximum(0.0, np.abs(diff_12) - temp_spatial_diff_thresh) * self.temp_spatial_weight
                 self._spatial_residuals[0::2] = spatial_penalty_01
                 self._spatial_residuals[1::2] = spatial_penalty_12
             else:
                 # Only one adjacent pair per case in 2-seg mode
                 diff = dT_matrix[:, 1] - dT_matrix[:, 0]
-                spatial_penalty = np.maximum(0.0, np.abs(diff) - 5.0) * self.temp_spatial_weight
+                spatial_penalty = np.maximum(0.0, np.abs(diff) - temp_spatial_diff_thresh) * self.temp_spatial_weight
                 self._spatial_residuals[:] = spatial_penalty
         else:
             self._spatial_residuals[:] = 0.0
 
         # 3. Temporal regularization
+        temp_temporal_diff_thresh = 1.0
         if self.temp_temporal_weight > 0:
             dT_diff = dT_matrix[1:, :] - dT_matrix[:-1, :]
-            temporal_penalty = np.maximum(0.0, np.abs(dT_diff) - 3.0) * self.temp_temporal_weight
+            temporal_penalty = np.maximum(0.0, np.abs(dT_diff) - temp_temporal_diff_thresh) * self.temp_temporal_weight
             self._temporal_residuals[:] = temporal_penalty.ravel()
         else:
             self._temporal_residuals[:] = 0.0
