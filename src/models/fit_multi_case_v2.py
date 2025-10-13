@@ -6,7 +6,7 @@ Additional optimizations over fit_multi_case_optimized.py:
 2. Batch solve - solve all cases simultaneously using BLAS Level 3
 3. Vectorized regularization computation
 4. Pre-allocate arrays to reduce memory allocations
-5. Support for multiple measurement types (reactions, displacements, rotations)
+5. Support for multiple measurement types (reactions, displacements, rotations, span rotations)
 
 Expected performance improvement: 1.5-2x over fit_multi_case_optimized.py
 
@@ -42,6 +42,15 @@ Usage:
         --use-rotations \
         --displacement-weight 10.0 \
         --rotation-weight 1000.0 \
+        --maxiter 500
+    
+    # 使用跨中转角测量值增强鲁棒性
+    uv run python src/models/fit_multi_case_v2.py \
+        --data data/augmented/dt_24hours_data_new2_round4.csv \
+        --use-rotations \
+        --use-span-rotations \
+        --rotation-weight 100.0 \
+        --span-rotation-weight 50.0 \
         --maxiter 500
     
     # 仅使用位移（不使用反力和转角）
@@ -81,19 +90,23 @@ class MeasurementConfig:
         use_reactions: Use support reactions (R_a, R_b, R_c, R_d)
         use_displacements: Use support vertical displacements (v_A, v_B, v_C, v_D)
         use_rotations: Use support rotations (theta_A, theta_B, theta_C, theta_D)
+        use_span_rotations: Use span rotations (theta_S1-5_6L, theta_S2-4_6L, theta_S3-5_6L)
         displacement_weight: Weight for displacement residuals relative to reactions
         rotation_weight: Weight for rotation residuals relative to reactions
+        span_rotation_weight: Weight for span rotation residuals relative to reactions
         auto_normalize: Automatically normalize residuals by measurement std (recommended)
     """
     use_reactions: bool = True
     use_displacements: bool = False
     use_rotations: bool = False
+    use_span_rotations: bool = False
     displacement_weight: float = 1.0
     rotation_weight: float = 1.0
+    span_rotation_weight: float = 1.0
     auto_normalize: bool = True  # 自动归一化（推荐）
     
     def __post_init__(self):
-        if not any([self.use_reactions, self.use_displacements, self.use_rotations]):
+        if not any([self.use_reactions, self.use_displacements, self.use_rotations, self.use_span_rotations]):
             raise ValueError("At least one measurement type must be enabled")
     
     def count_measurements_per_case(self) -> int:
@@ -105,6 +118,8 @@ class MeasurementConfig:
             count += 4  # 4 support displacements
         if self.use_rotations:
             count += 4  # 4 support rotations
+        if self.use_span_rotations:
+            count += 3  # 3 span rotations (S1-5/6L, S2-4/6L, S3-5/6L)
         return count
     
     def describe(self) -> str:
@@ -116,6 +131,8 @@ class MeasurementConfig:
             parts.append(f"位移(4, 权重={self.displacement_weight})")
         if self.use_rotations:
             parts.append(f"转角(4, 权重={self.rotation_weight})")
+        if self.use_span_rotations:
+            parts.append(f"跨中转角(3, 权重={self.span_rotation_weight})")
         
         if self.auto_normalize:
             parts.append("自动归一化")
@@ -165,21 +182,25 @@ def load_multi_case_data(
         reaction_cols = ['R_a_kN', 'R_b_kN', 'R_c_kN', 'R_d_kN']
         displacement_cols = ['v_A_mm', 'v_B_mm', 'v_C_mm', 'v_D_mm']
         rotation_cols = ['theta_A_rad', 'theta_B_rad', 'theta_C_rad', 'theta_D_rad']
+        span_rotation_cols = ['theta_S1-5_6L_rad', 'theta_S2-4_6L_rad', 'theta_S3-5_6L_rad']
         
         has_reactions = all(col in df.columns for col in reaction_cols)
         has_displacements = all(col in df.columns for col in displacement_cols)
         has_rotations = all(col in df.columns for col in rotation_cols)
+        has_span_rotations = all(col in df.columns for col in span_rotation_cols)
         
         print(f"\n可用测量数据:")
         print(f"  反力 (R_a~R_d): {'✓' if has_reactions else '✗'}")
         print(f"  位移 (v_A~v_D): {'✓' if has_displacements else '✗'}")
         print(f"  转角 (theta_A~theta_D): {'✓' if has_rotations else '✗'}")
+        print(f"  跨中转角 (S1-5/6L, S2-4/6L, S3-5/6L): {'✓' if has_span_rotations else '✗'}")
         
         # Default: use only reactions
         measurement_config = MeasurementConfig(
             use_reactions=has_reactions,
             use_displacements=False,
             use_rotations=False,
+            use_span_rotations=False,
         )
         print(f"\n默认使用: 仅反力")
     
@@ -256,7 +277,7 @@ def batch_thermal_load_vectors(
 def batch_solve_with_system(
     system: StructuralSystem,
     dT_matrix: np.ndarray,  # shape: (n_cases, 2 or 3)
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Batch solve for all cases simultaneously.
     
     Args:
@@ -268,6 +289,8 @@ def batch_solve_with_system(
         reactions_all: Reactions, shape (n_cases, 4)
         displacements_all: Support vertical displacements, shape (n_cases, 4)
         rotations_all: Support rotations, shape (n_cases, 4)
+        span_rotations_all: Span rotations at 3 locations, shape (n_cases, 3)
+                           [theta_S1-5_6L, theta_S2-4_6L, theta_S3-5_6L]
     """
     n_cases = dT_matrix.shape[0]
     
@@ -298,7 +321,22 @@ def batch_solve_with_system(
         # Reaction force
         reactions_all[:, i] = -system.kv_values[i] * (ui_all - system.settlements[i]) / 1_000.0
     
-    return U_all, reactions_all, displacements_all, rotations_all
+    # Extract span rotations using rotation sampling matrix
+    # Compute rotation matrix for specific span sensor locations
+    from models.bridge_forward_model import rotation_sampling_matrix
+    
+    # Keys for S1-5/6L, S2-4/6L, S3-5/6L rotations
+    span_rotation_keys = [
+        'theta_S1-5_6L_rad',
+        'theta_S2-4_6L_rad',
+        'theta_S3-5_6L_rad',
+    ]
+    rot_mat_span = rotation_sampling_matrix(system.struct_params.ne_per_span, span_rotation_keys)
+    
+    # Apply rotation matrix to all displacement vectors: (3, ndof) @ (ndof, n_cases) -> (3, n_cases)
+    span_rotations_all = (rot_mat_span @ U_all.T).T  # shape: (n_cases, 3)
+    
+    return U_all, reactions_all, displacements_all, rotations_all, span_rotations_all
 
 
 class VectorizedMultiCaseFitter:
@@ -317,6 +355,7 @@ class VectorizedMultiCaseFitter:
         measurement_config: Optional[MeasurementConfig] = None,
         displacements_matrix: Optional[np.ndarray] = None,  # shape: (n_cases, 4)
         rotations_matrix: Optional[np.ndarray] = None,  # shape: (n_cases, 4)
+        span_rotations_matrix: Optional[np.ndarray] = None,  # shape: (n_cases, 3)
     ):
         """
         Args:
@@ -331,6 +370,8 @@ class VectorizedMultiCaseFitter:
             measurement_config: Configuration for which measurements to use
             displacements_matrix: Measured displacements, shape (n_cases, 4) if using
             rotations_matrix: Measured rotations, shape (n_cases, 4) if using
+            span_rotations_matrix: Measured span rotations, shape (n_cases, 3) if using
+                                  [theta_S1-5_6L, theta_S2-4_6L, theta_S3-5_6L]
         """
         self.reactions_matrix = reactions_matrix
         self.n_cases = reactions_matrix.shape[0]
@@ -352,12 +393,15 @@ class VectorizedMultiCaseFitter:
         # Store measurement matrices
         self.displacements_matrix = displacements_matrix
         self.rotations_matrix = rotations_matrix
+        self.span_rotations_matrix = span_rotations_matrix
         
         # Validate measurement configuration
         if measurement_config.use_displacements and displacements_matrix is None:
             raise ValueError("displacements_matrix required when use_displacements=True")
         if measurement_config.use_rotations and rotations_matrix is None:
             raise ValueError("rotations_matrix required when use_rotations=True")
+        if measurement_config.use_span_rotations and span_rotations_matrix is None:
+            raise ValueError("span_rotations_matrix required when use_span_rotations=True")
         
         # Compute normalization scales (standard deviations) for auto-normalization
         self.reaction_scale = np.std(reactions_matrix) if measurement_config.auto_normalize else 1.0
@@ -369,6 +413,10 @@ class VectorizedMultiCaseFitter:
             np.std(rotations_matrix) if (measurement_config.auto_normalize and rotations_matrix is not None) 
             else 1.0
         )
+        self.span_rotation_scale = (
+            np.std(span_rotations_matrix) if (measurement_config.auto_normalize and span_rotations_matrix is not None) 
+            else 1.0
+        )
         
         # Avoid division by zero
         if self.reaction_scale < 1e-10:
@@ -377,6 +425,8 @@ class VectorizedMultiCaseFitter:
             self.displacement_scale = 1.0
         if self.rotation_scale < 1e-10:
             self.rotation_scale = 1.0
+        if self.span_rotation_scale < 1e-10:
+            self.span_rotation_scale = 1.0
         
         # Cache
         self._cached_system: StructuralSystem | None = None
@@ -552,7 +602,7 @@ class VectorizedMultiCaseFitter:
         system = self._get_or_assemble_system(struct_params)
         
         # 1. Physics residuals - compute all responses
-        _, reactions_all, displacements_all, rotations_all = batch_solve_with_system(system, dT_matrix)
+        _, reactions_all, displacements_all, rotations_all, span_rotations_all = batch_solve_with_system(system, dT_matrix)
         
         # Build physics residuals based on measurement configuration
         # Apply normalization by std and user-specified weights
@@ -569,6 +619,18 @@ class VectorizedMultiCaseFitter:
             # Normalize by std (if auto_normalize) then apply user weight
             displacement_residuals = (displacement_residuals / self.displacement_scale) * self.measurement_config.displacement_weight
             residuals_list.append(displacement_residuals)
+        
+        if self.measurement_config.use_rotations:
+            rotation_residuals = (rotations_all - self.rotations_matrix).ravel()
+            # Normalize by std (if auto_normalize) then apply user weight
+            rotation_residuals = (rotation_residuals / self.rotation_scale) * self.measurement_config.rotation_weight
+            residuals_list.append(rotation_residuals)
+        
+        if self.measurement_config.use_span_rotations:
+            span_rotation_residuals = (span_rotations_all - self.span_rotations_matrix).ravel()
+            # Normalize by std (if auto_normalize) then apply user weight
+            span_rotation_residuals = (span_rotation_residuals / self.span_rotation_scale) * self.measurement_config.span_rotation_weight
+            residuals_list.append(span_rotation_residuals)
         
         if self.measurement_config.use_rotations:
             rotation_residuals = (rotations_all - self.rotations_matrix).ravel()
@@ -646,13 +708,14 @@ class VectorizedMultiCaseFitter:
         thermal_states = [ThermalState(dT_spans=tuple(row)) for row in dT_matrix]  # type: ignore[arg-type]
         
         # Compute final residuals by measurement type
-        _, reactions_all, displacements_all, rotations_all = batch_solve_with_system(
+        _, reactions_all, displacements_all, rotations_all, span_rotations_all = batch_solve_with_system(
             self._get_or_assemble_system(struct_params), dT_matrix
         )
         
         reaction_residuals = reactions_all - self.reactions_matrix if self.measurement_config.use_reactions else None
         displacement_residuals = displacements_all - self.displacements_matrix if self.measurement_config.use_displacements else None
         rotation_residuals = rotations_all - self.rotations_matrix if self.measurement_config.use_rotations else None
+        span_rotation_residuals = span_rotations_all - self.span_rotations_matrix if self.measurement_config.use_span_rotations else None
         
         print(f"\n性能统计:")
         print(f"  残差函数调用次数: {self._n_residual_calls}")
@@ -668,9 +731,11 @@ class VectorizedMultiCaseFitter:
             'reaction_residuals': reaction_residuals,
             'displacement_residuals': displacement_residuals,
             'rotation_residuals': rotation_residuals,
+            'span_rotation_residuals': span_rotation_residuals,
             'reactions_computed': reactions_all,
             'displacements_computed': displacements_all,
             'rotations_computed': rotations_all,
+            'span_rotations_computed': span_rotations_all,
             'cost': result.cost,
             'optimality': result.optimality,
             'nfev': result.nfev,
@@ -704,10 +769,14 @@ def main():
                         help='使用支座位移测量值 (v_A, v_B, v_C, v_D)')
     parser.add_argument('--use-rotations', action='store_true',
                         help='使用支座转角测量值 (theta_A, theta_B, theta_C, theta_D)')
+    parser.add_argument('--use-span-rotations', action='store_true',
+                        help='使用跨中转角测量值 (theta_S1-5_6L, theta_S2-4_6L, theta_S3-5_6L)')
     parser.add_argument('--displacement-weight', type=float, default=1.0,
                         help='位移残差权重 (相对于反力，默认1.0)')
     parser.add_argument('--rotation-weight', type=float, default=1.0,
                         help='转角残差权重 (相对于反力，默认1.0)')
+    parser.add_argument('--span-rotation-weight', type=float, default=1.0,
+                        help='跨中转角残差权重 (相对于反力，默认1.0)')
     parser.add_argument('--no-auto-normalize', action='store_true',
                         help='禁用自动归一化（默认启用，基于测量数据标准差归一化）')
     
@@ -723,8 +792,10 @@ def main():
         use_reactions=True,  # Always use reactions
         use_displacements=args.use_displacements,
         use_rotations=args.use_rotations,
+        use_span_rotations=args.use_span_rotations,
         displacement_weight=args.displacement_weight,
         rotation_weight=args.rotation_weight,
+        span_rotation_weight=args.span_rotation_weight,
         auto_normalize=not args.no_auto_normalize,  # Default: enabled
     )
     
@@ -754,6 +825,16 @@ def main():
         else:
             print(f"\n✗ 警告: 请求使用转角但数据中不包含，将跳过转角约束")
             measurement_config.use_rotations = False
+    
+    span_rotations_matrix = None
+    if measurement_config.use_span_rotations:
+        span_rot_cols = ['theta_S1-5_6L_rad', 'theta_S2-4_6L_rad', 'theta_S3-5_6L_rad']
+        if all(col in df.columns for col in span_rot_cols):
+            span_rotations_matrix = df[span_rot_cols].to_numpy()
+            print(f"\n✓ 使用跨中转角测量值 (权重={measurement_config.span_rotation_weight})")
+        else:
+            print(f"\n✗ 警告: 请求使用跨中转角但数据中不包含，将跳过跨中转角约束")
+            measurement_config.use_span_rotations = False
     
     # Temperature columns detection
     requested_segments = int(args.temp_segments)
@@ -802,6 +883,7 @@ def main():
         measurement_config=measurement_config,
         displacements_matrix=displacements_matrix,
         rotations_matrix=rotations_matrix,
+        span_rotations_matrix=span_rotations_matrix,
     )
     
     # Fit
@@ -894,6 +976,13 @@ def main():
         print(f"    最大残差: {np.max(np.abs(rot_res)):.6e} rad")
         print(f"    平均残差: {np.mean(np.abs(rot_res)):.6e} rad")
     
+    if result['span_rotation_residuals'] is not None:
+        span_rot_res = result['span_rotation_residuals']
+        print(f"\n  跨中转角残差:")
+        print(f"    RMSE:     {np.sqrt(np.mean(span_rot_res**2)):.6e} rad")
+        print(f"    最大残差: {np.max(np.abs(span_rot_res)):.6e} rad")
+        print(f"    平均残差: {np.mean(np.abs(span_rot_res)):.6e} rad")
+    
     # Temperature examples
     print(f"\n温度梯度示例 (前5个工况):")
     for i in range(min(5, len(result['thermal_states']))):
@@ -920,7 +1009,7 @@ def main():
     
     # Extract fitted temperature matrix and recompute all responses
     fitted_dT_matrix = np.array([ts.dT_spans for ts in result['thermal_states']])
-    _, recomputed_reactions, recomputed_displacements, recomputed_rotations = batch_solve_with_system(
+    _, recomputed_reactions, recomputed_displacements, recomputed_rotations, recomputed_span_rotations = batch_solve_with_system(
         fitted_system, fitted_dT_matrix
     )
     
@@ -937,6 +1026,18 @@ def main():
         print(f"  位移:")
         print(f"    RMSE:     {np.sqrt(np.mean(disp_forward_res**2)):.6e} mm")
         print(f"    最大残差: {np.max(np.abs(disp_forward_res)):.6e} mm")
+    
+    if rotations_matrix is not None:
+        rot_forward_res = recomputed_rotations - rotations_matrix
+        print(f"  转角:")
+        print(f"    RMSE:     {np.sqrt(np.mean(rot_forward_res**2)):.6e} rad")
+        print(f"    最大残差: {np.max(np.abs(rot_forward_res)):.6e} rad")
+    
+    if span_rotations_matrix is not None:
+        span_rot_forward_res = recomputed_span_rotations - span_rotations_matrix
+        print(f"  跨中转角:")
+        print(f"    RMSE:     {np.sqrt(np.mean(span_rot_forward_res**2)):.6e} rad")
+        print(f"    最大残差: {np.max(np.abs(span_rot_forward_res)):.6e} rad")
     
     if rotations_matrix is not None:
         rot_forward_res = recomputed_rotations - rotations_matrix
@@ -1005,6 +1106,11 @@ def main():
             output_df[f'v_{name.upper()}_recomputed_mm'] = recomputed_displacements[:, i]
             output_df[f'theta_{name.upper()}_recomputed_rad'] = recomputed_rotations[:, i]
         
+        # Recomputed span rotations
+        span_names = ['S1-5_6L', 'S2-4_6L', 'S3-5_6L']
+        for i, name in enumerate(span_names):
+            output_df[f'theta_{name}_recomputed_rad'] = recomputed_span_rotations[:, i]
+        
         # Optimizer residuals
         if result['reaction_residuals'] is not None:
             for i in range(4):
@@ -1017,6 +1123,10 @@ def main():
         if result['rotation_residuals'] is not None:
             for i in range(4):
                 output_df[f'residual_optimizer_theta{i+1}'] = result['rotation_residuals'][:, i]
+        
+        if result['span_rotation_residuals'] is not None:
+            for i in range(3):
+                output_df[f'residual_optimizer_span_theta{i+1}'] = result['span_rotation_residuals'][:, i]
         
         # Forward model residuals
         for i in range(4):
@@ -1032,12 +1142,17 @@ def main():
             for i in range(4):
                 output_df[f'residual_forward_theta{i+1}'] = rot_forward_res[:, i]
         
+        if span_rotations_matrix is not None:
+            span_rot_forward_res = recomputed_span_rotations - span_rotations_matrix
+            for i in range(3):
+                output_df[f'residual_forward_span_theta{i+1}'] = span_rot_forward_res[:, i]
+        
         output_df.to_csv(args.output, index=False)
         print(f"\n结果已保存到: {args.output}")
         print(f"\n输出文件包含:")
         print(f"  - 拟合的结构参数 (11个)")
         print(f"  - 拟合的温度参数 (每工况 {actual_segments} 个)")
-        print(f"  - 正模型重算的响应 (反力、位移、转角)")
+        print(f"  - 正模型重算的响应 (反力、位移、转角、跨中转角)")
         print(f"  - 优化器残差 ({measurement_config.describe()})")
         print(f"  - 正模型残差 (用于验证)")
 
