@@ -947,10 +947,15 @@ def main():
     ])
     fitted_kv = np.array(sp.kv_factors)
     
+    # Temperature RMSE calculation
+    fitted_temps = np.array([ts.dT_spans for ts in result['thermal_states']])
+    temp_rmse = np.sqrt(np.mean((fitted_temps - true_temps)**2))
+    
     print(f"\n结构参数误差:")
     print(f"  Settlements RMSE: {np.sqrt(np.mean((fitted_settlements - true_settlements)**2)):.4f} mm")
     print(f"  EI factors RMSE:  {np.sqrt(np.mean((fitted_ei - true_ei)**2)):.6f}")
     print(f"  Kv factors RMSE:  {np.sqrt(np.mean((fitted_kv - true_kv)**2)):.6f}")
+    print(f"  Temperature RMSE: {temp_rmse:.4f} °C")
     
     # Residuals by measurement type
     print(f"\n残差统计 ({len(result['thermal_states'])} 工况):")
