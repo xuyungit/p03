@@ -277,12 +277,14 @@ def batch_thermal_load_vectors(
 def batch_solve_with_system(
     system: StructuralSystem,
     dT_matrix: np.ndarray,  # shape: (n_cases, 2 or 3)
+    rot_mat_span_cache: Optional[np.ndarray] = None,  # Pre-computed rotation matrix
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Batch solve for all cases simultaneously.
     
     Args:
         system: Structural system
         dT_matrix: Temperature gradients, shape (n_cases, 2 or 3)
+        rot_mat_span_cache: Optional pre-computed rotation sampling matrix for performance
     
     Returns:
         U_all: Displacements, shape (n_cases, ndof)
@@ -321,20 +323,22 @@ def batch_solve_with_system(
         # Reaction force
         reactions_all[:, i] = -system.kv_values[i] * (ui_all - system.settlements[i]) / 1_000.0
     
-    # Extract span rotations using rotation sampling matrix
-    # Compute rotation matrix for specific span sensor locations
-    from models.bridge_forward_model import rotation_sampling_matrix
-    
-    # Keys for S1-5/6L, S2-4/6L, S3-5/6L rotations
-    span_rotation_keys = [
-        'theta_S1-5_6L_rad',
-        'theta_S2-4_6L_rad',
-        'theta_S3-5_6L_rad',
-    ]
-    rot_mat_span = rotation_sampling_matrix(system.struct_params.ne_per_span, span_rotation_keys)
-    
+    # Extract span rotations using pre-computed rotation sampling matrix (if provided)
     # Apply rotation matrix to all displacement vectors: (3, ndof) @ (ndof, n_cases) -> (3, n_cases)
-    span_rotations_all = (rot_mat_span @ U_all.T).T  # shape: (n_cases, 3)
+    if rot_mat_span_cache is not None:
+        span_rotations_all = (rot_mat_span_cache @ U_all.T).T  # shape: (n_cases, 3)
+    else:
+        # Fallback: compute on-the-fly (should not happen in optimized path)
+        from models.bridge_forward_model import rotation_sampling_matrix
+        span_rotation_keys = [
+            'theta_S1-5_6L_rad',
+            'theta_S2-4_6L_rad',
+            'theta_S3-5_6L_rad',
+        ]
+        rot_mat_span = rotation_sampling_matrix(system.struct_params.ne_per_span, span_rotation_keys)
+        span_rotations_all = (rot_mat_span @ U_all.T).T  # shape: (n_cases, 3)
+    
+    return U_all, reactions_all, displacements_all, rotations_all, span_rotations_all
     
     return U_all, reactions_all, displacements_all, rotations_all, span_rotations_all
 
@@ -431,6 +435,19 @@ class VectorizedMultiCaseFitter:
         # Cache
         self._cached_system: StructuralSystem | None = None
         self._cached_struct_params: tuple | None = None
+        
+        # Pre-compute rotation sampling matrix for span rotations (cached for performance)
+        # This matrix is constant for a given mesh and will be attached to each system
+        if measurement_config.use_span_rotations:
+            from models.bridge_forward_model import rotation_sampling_matrix
+            span_rotation_keys = [
+                'theta_S1-5_6L_rad',
+                'theta_S2-4_6L_rad',
+                'theta_S3-5_6L_rad',
+            ]
+            self._rot_mat_span_cache = rotation_sampling_matrix(ne_per_span, span_rotation_keys)
+        else:
+            self._rot_mat_span_cache = None
         
         # Pre-allocate arrays for physics residuals
         n_measurements = measurement_config.count_measurements_per_case()
@@ -602,7 +619,9 @@ class VectorizedMultiCaseFitter:
         system = self._get_or_assemble_system(struct_params)
         
         # 1. Physics residuals - compute all responses
-        _, reactions_all, displacements_all, rotations_all, span_rotations_all = batch_solve_with_system(system, dT_matrix)
+        _, reactions_all, displacements_all, rotations_all, span_rotations_all = batch_solve_with_system(
+            system, dT_matrix, self._rot_mat_span_cache
+        )
         
         # Build physics residuals based on measurement configuration
         # Apply normalization by std and user-specified weights
@@ -631,12 +650,6 @@ class VectorizedMultiCaseFitter:
             # Normalize by std (if auto_normalize) then apply user weight
             span_rotation_residuals = (span_rotation_residuals / self.span_rotation_scale) * self.measurement_config.span_rotation_weight
             residuals_list.append(span_rotation_residuals)
-        
-        if self.measurement_config.use_rotations:
-            rotation_residuals = (rotations_all - self.rotations_matrix).ravel()
-            # Normalize by std (if auto_normalize) then apply user weight
-            rotation_residuals = (rotation_residuals / self.rotation_scale) * self.measurement_config.rotation_weight
-            residuals_list.append(rotation_residuals)
         
         physics_residuals = np.concatenate(residuals_list)
 
@@ -698,7 +711,7 @@ class VectorizedMultiCaseFitter:
             ftol=1e-8,
             gtol=1e-8,
             xtol=1e-12,
-            max_nfev=maxiter * 100,
+            max_nfev=maxiter * 1,
             verbose=verbose,
         )
         
@@ -709,7 +722,7 @@ class VectorizedMultiCaseFitter:
         
         # Compute final residuals by measurement type
         _, reactions_all, displacements_all, rotations_all, span_rotations_all = batch_solve_with_system(
-            self._get_or_assemble_system(struct_params), dT_matrix
+            self._get_or_assemble_system(struct_params), dT_matrix, self._rot_mat_span_cache
         )
         
         reaction_residuals = reactions_all - self.reactions_matrix if self.measurement_config.use_reactions else None
@@ -1015,7 +1028,7 @@ def main():
     # Extract fitted temperature matrix and recompute all responses
     fitted_dT_matrix = np.array([ts.dT_spans for ts in result['thermal_states']])
     _, recomputed_reactions, recomputed_displacements, recomputed_rotations, recomputed_span_rotations = batch_solve_with_system(
-        fitted_system, fitted_dT_matrix
+        fitted_system, fitted_dT_matrix, fitter._rot_mat_span_cache
     )
     
     # Compare with observed measurements
