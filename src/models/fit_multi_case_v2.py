@@ -69,7 +69,6 @@ from typing import Tuple, List, Optional
 
 import numpy as np
 import pandas as pd
-from scipy.linalg import lu_solve
 from scipy.optimize import least_squares
 
 from models.bridge_forward_model import (
@@ -77,6 +76,8 @@ from models.bridge_forward_model import (
     StructuralSystem,
     ThermalState,
     assemble_structural_system,
+    set_span_lengths_mm,
+    solve_linear,
     ALPHA,
     H_MM,
 )
@@ -204,12 +205,29 @@ def load_multi_case_data(
         )
         print(f"\n默认使用: 仅反力")
     
+    span_cols = ["span_length_s1_mm", "span_length_s2_mm", "span_length_s3_mm"]
+    has_span_cols = all(col in df.columns for col in span_cols)
+    if has_span_cols:
+        spans_mm = tuple(float(df[col].iloc[0]) for col in span_cols)
+        for i, col in enumerate(span_cols):
+            if not np.isclose(df[col], spans_mm[i]).all():
+                raise ValueError("span_length_x_mm 列应为常数")
+        set_span_lengths_mm(spans_mm)
+        print(
+            "  侦测到跨度配置: "
+            f"S1={spans_mm[0]/1000:.2f} m, S2={spans_mm[1]/1000:.2f} m, S3={spans_mm[2]/1000:.2f} m"
+        )
+    else:
+        print("  未检测到跨度列，使用默认 40:40:40 m")
+
     # Verify structural parameters are constant
     struct_cols = [
         'settlement_a_mm', 'settlement_b_mm', 'settlement_c_mm', 'settlement_d_mm',
         'ei_factor_s1', 'ei_factor_s2', 'ei_factor_s3',
         'kv_factor_a', 'kv_factor_b', 'kv_factor_c', 'kv_factor_d',
     ]
+    if has_span_cols:
+        struct_cols.extend(span_cols)
     
     const_params = {}
     for col in struct_cols:
@@ -302,9 +320,8 @@ def batch_solve_with_system(
     # Compute right-hand sides: (n_cases, ndof)
     F_all = system.load_base[np.newaxis, :] - thermal_loads
     
-    # Batch solve using BLAS Level 3: solve K @ U = F for multiple RHS
-    # lu_solve accepts (ndof, n_cases) format
-    U_all = lu_solve((system.lu, system.piv), F_all.T).T  # shape: (n_cases, ndof)
+    # Batch solve using shared linear solver (SciPy if available, otherwise NumPy)
+    U_all = solve_linear(system, F_all.T).T  # shape: (n_cases, ndof)
     
     # Extract reactions, displacements, and rotations for all cases
     reactions_all = np.zeros((n_cases, 4), dtype=float)

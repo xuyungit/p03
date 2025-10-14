@@ -1,379 +1,84 @@
-"""Reusable bridge forward model for reaction and rotation evaluation.
-
-This module extracts the core finite-element routine from
-``data/bridge_reaction_sampling.py`` and fixes the support stiffness factors to
-unity. It exposes a minimal API that maps structural parameters and thermal
-states to reactions and sensor rotations, which can serve as the forward model
-\(\mathcal{M}\) in the bias-estimation workflow.
-"""
+"""Reusable bridge forward model built on shared mechanics utilities."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from functools import lru_cache
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Sequence
 
 import numpy as np
-from scipy.linalg import lu_factor, lu_solve
 
-# ----------------- 常量与几何参数 -----------------
-E = 206_000.0                  # N/mm^2（钢）
-Iy = 3.154279e11               # mm^4
-EI_BASE = E * Iy               # N·mm^2
-
-LMM = 40_000.0                 # 每跨长度 mm
-SPAN_LEN = [LMM, LMM, LMM]
-TOTAL_LEN = float(sum(SPAN_LEN))
-
-# 均布恒载（向下为负，单位 N/mm）
-Q_UNIFORM = -(12.0 + 20.0 + 29.64)
-
-# 支座基准刚度（N/mm）
-KV0 = 5_000.0 * 1_000.0
-
-# 温差到曲率：κ = α·ΔT/h
-ALPHA = 1.2e-5                 # 1/°C
-H_MM = 2_000.0                 # mm
+from bridge import mechanics as _mech
 
 
-# ----------------- 数据结构 -----------------
-@dataclass
-class StructuralParams:
-    """Parameters held constant within a measurement window."""
+# Re-export core constants and data structures for backwards compatibility.
+E = _mech.E
+Iy = _mech.Iy
+EI_BASE = _mech.EI_BASE
+Q_UNIFORM = _mech.Q_UNIFORM
+KV0 = _mech.KV0
+ALPHA = _mech.ALPHA
+H_MM = _mech.H_MM
 
-    settlements: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
-    ei_factors: Tuple[float, float, float] = (1.0, 1.0, 1.0)
-    kv_factors: Tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
-    uniform_load: float = Q_UNIFORM
-    ne_per_span: int = 64
-
-
-@dataclass
-class ThermalState:
-    """Per-sample temperature gradient parameters.
-
-    Supports either three per-span values (legacy, one per 40 m span),
-    or two half-bridge values (50%/50% split along total length).
-
-    - If ``len(dT_spans) == 3``: use per-span mapping as before.
-    - If ``len(dT_spans) == 2``: use equal-length two-segment mapping, where
-      the first value applies to the first half of the 120 m bridge and the
-      second value applies to the second half.
-    """
-
-    dT_spans: Tuple[float, ...] = (0.0, 0.0, 0.0)
+StructuralParams = _mech.StructuralParams
+ThermalState = _mech.ThermalState
+BridgeResponse = _mech.BridgeResponse
+MeshData = _mech.MeshData
+StructuralSystem = _mech.StructuralSystem
 
 
-@dataclass
-class BridgeResponse:
-    """Outputs from a forward evaluation."""
-
-    reactions_kN: np.ndarray
-    sensor_map: Dict[str, float]
-    displacements: np.ndarray
+def get_span_lengths_mm() -> tuple[float, float, float]:
+    return _mech.get_span_lengths_mm()
 
 
-@dataclass
-class MeshData:
-    """Precomputed mesh description for a given discretisation."""
-
-    x_coords: np.ndarray
-    elements: Tuple[Tuple[int, int, float, int], ...]
+def set_span_lengths_mm(lengths_mm: Sequence[float]) -> None:
+    _mech.set_span_lengths_mm(lengths_mm)
 
 
-@dataclass
-class StructuralSystem:
-    """Linear system assembled for fixed structural parameters."""
-
-    struct_params: StructuralParams
-    mesh: MeshData
-    lu: np.ndarray
-    piv: np.ndarray
-    load_base: np.ndarray
-    kv_values: np.ndarray
-    settlements: np.ndarray
-    support_nodes: Tuple[int, int, int, int]
-    span_ei: Tuple[float, float, float]
+def span_breakpoints_mm() -> tuple[float, float, float, float]:
+    return _mech.span_breakpoints_mm()
 
 
-# ----------------- 梁单元 FE 工具 -----------------
-def k_beam(ei: float, L: float) -> np.ndarray:
-    fac = ei / (L ** 3)
-    L2 = L * L
-    return fac * np.array(
-        [
-            [12.0, 6.0 * L, -12.0, 6.0 * L],
-            [6.0 * L, 4.0 * L2, -6.0 * L, 2.0 * L2],
-            [-12.0, -6.0 * L, 12.0, -6.0 * L],
-            [6.0 * L, 2.0 * L2, -6.0 * L, 4.0 * L2],
-        ],
-        dtype=float,
-    )
+def total_length_mm() -> float:
+    return _mech.total_length_mm()
 
 
-def f_udl(q: float, L: float) -> np.ndarray:
-    return np.array([q * L / 2.0, q * L * L / 12.0, q * L / 2.0, -q * L * L / 12.0], dtype=float)
-
-
-def f_thermal(ei: float, kappa: float) -> np.ndarray:
-    # 固定端弯矩等效：EIκ * [0, -1, 0, +1]
-    return ei * kappa * np.array([0.0, -1.0, 0.0, +1.0], dtype=float)
-
-
-@lru_cache(maxsize=None)
 def build_mesh(ne_per_span: int) -> MeshData:
-    elements: List[Tuple[int, int, float, int]] = []
-    x = [0.0]
-    for si, L in enumerate(SPAN_LEN):
-        dx = L / ne_per_span
-        for _ in range(ne_per_span):
-            n1 = len(x) - 1
-            n2 = n1 + 1
-            elements.append((n1, n2, dx, si))
-            x.append(x[-1] + dx)
-    mesh = MeshData(x_coords=np.array(x, dtype=float), elements=tuple(elements))
-    return mesh
-
-
-# ----------------- 采样矩阵工具 -----------------
-def _sensor_points_labels() -> Tuple[Tuple[float, ...], Tuple[str, ...]]:
-    pts: List[float] = []
-    labs: List[str] = []
-    # A
-    pts.append(0.0); labs.append("A")
-    # S1
-    for k in range(1, 6):
-        pts.append(k / 6.0 * LMM)
-        labs.append(f"S1-{k}/6L")
-    # B
-    pts.append(1.0 * LMM); labs.append("B")
-    # S2
-    for k in range(1, 6):
-        pts.append(LMM + k / 6.0 * LMM)
-        labs.append(f"S2-{k}/6L")
-    # C
-    pts.append(2.0 * LMM); labs.append("C")
-    # S3
-    for k in range(1, 6):
-        pts.append(2 * LMM + k / 6.0 * LMM)
-        labs.append(f"S3-{k}/6L")
-    # D
-    pts.append(3.0 * LMM); labs.append("D")
-    return tuple(pts), tuple(labs)
-
-
-def _find_element(x_coords: np.ndarray, x: float) -> Tuple[int, float, float]:
-    if x >= x_coords[-1]:
-        i = len(x_coords) - 2
-    else:
-        j = int(np.searchsorted(x_coords, x, side="right"))
-        i = max(0, j - 1)
-    xi = x_coords[i]
-    L = x_coords[i + 1] - x_coords[i]
-    return i, L, x - xi
-
-
-@lru_cache(maxsize=None)
-def _sampling_matrices(ne_per_span: int) -> Tuple[Tuple[str, ...], np.ndarray, np.ndarray]:
-    mesh = build_mesh(ne_per_span)
-    x_coords = mesh.x_coords
-    ndof = 2 * len(x_coords)
-    pts, labs = _sensor_points_labels()
-
-    def_mat = np.zeros((len(labs), ndof), dtype=float)
-    rot_mat = np.zeros((len(labs), ndof), dtype=float)
-
-    for row, (x, lab) in enumerate(zip(pts, labs)):
-        i, L, xl = _find_element(x_coords, x)
-        dof = [2 * i, 2 * i + 1, 2 * (i + 1), 2 * (i + 1) + 1]
-        xi = xl / L
-        N1 = 1.0 - 3.0 * xi * xi + 2.0 * xi * xi * xi
-        N2 = L * (xi - 2.0 * xi * xi + xi * xi * xi)
-        N3 = 3.0 * xi * xi - 2.0 * xi * xi * xi
-        N4 = L * (-xi * xi + xi * xi * xi)
-        dN1 = (-6.0 * xi + 6.0 * xi * xi) / L
-        dN2 = 1.0 - 4.0 * xi + 3.0 * xi * xi
-        dN3 = (6.0 * xi - 6.0 * xi * xi) / L
-        dN4 = -2.0 * xi + 3.0 * xi * xi
-
-        def_mat[row, dof] = [N1, N2, N3, N4]
-        rot_mat[row, dof] = [dN1, dN2, dN3, dN4]
-
-    rotation_keys = tuple(f"theta_{lab.replace('/', '_')}_rad" for lab in labs)
-    return rotation_keys, def_mat, rot_mat
-
-
-# ----------------- 结构系统缓存 -----------------
-def _support_nodes(mesh: MeshData) -> Tuple[int, int, int, int]:
-    support_x = [0.0, LMM, 2 * LMM, 3 * LMM]
-    nodes: List[int] = []
-    for xm in support_x:
-        idx = int(np.argmin(np.abs(mesh.x_coords - xm)))
-        nodes.append(idx)
-    return tuple(nodes)
+    return _mech.build_mesh(ne_per_span)
 
 
 def assemble_structural_system(struct_params: StructuralParams) -> StructuralSystem:
-    """Precompute stiffness factorisation and base loads for given parameters."""
-
-    mesh = build_mesh(struct_params.ne_per_span)
-    ndof = 2 * len(mesh.x_coords)
-    K = np.zeros((ndof, ndof), dtype=float)
-    F_base = np.zeros(ndof, dtype=float)
-
-    span_ei = tuple(EI_BASE * float(fac) for fac in struct_params.ei_factors)
-
-    for n1, n2, L, si in mesh.elements:
-        ei = span_ei[si]
-        ke = k_beam(ei, L)
-        fe = f_udl(struct_params.uniform_load, L)
-        dof = [2 * n1, 2 * n1 + 1, 2 * n2, 2 * n2 + 1]
-        K[np.ix_(dof, dof)] += ke
-        F_base[dof] += fe
-
-    support_nodes = _support_nodes(mesh)
-    settlements = np.asarray(struct_params.settlements, dtype=float)
-    kv_scale = np.asarray(struct_params.kv_factors, dtype=float)
-    if kv_scale.shape != (4,):
-        raise ValueError("kv_factors must contain four scale values for supports A-D.")
-    Kv = KV0 * kv_scale
-    for i, idx in enumerate(support_nodes):
-        K[2 * idx, 2 * idx] += Kv[i]
-        F_base[2 * idx] += Kv[i] * settlements[i]
-
-    lu, piv = lu_factor(K)
-
-    return StructuralSystem(
-        struct_params=struct_params,
-        mesh=mesh,
-        lu=lu,
-        piv=piv,
-        load_base=F_base,
-        kv_values=Kv,
-        settlements=settlements,
-        support_nodes=support_nodes,
-        span_ei=span_ei,
-    )
+    return _mech.assemble_structural_system(struct_params)
 
 
 def thermal_load_vector(system: StructuralSystem, thermal_state: ThermalState) -> np.ndarray:
-    """Assemble the global thermal load vector for the given thermal state.
-
-    Behavior:
-    - Three values (legacy): per-span constant gradients (one per span).
-    - Two values: 50%/50% split across the total length; elements with
-      midpoints in the first half use the first value, others use the second.
-    """
-    loads = np.zeros_like(system.load_base)
-
-    dT = tuple(thermal_state.dT_spans)
-    nvals = len(dT)
-    scale = (ALPHA / H_MM)
-
-    # Fast path: legacy 3-per-span behavior
-    if nvals == 3:
-        kappa_span = tuple(scale * np.array(dT))
-        for n1, n2, L, si in system.mesh.elements:
-            ei = system.span_ei[si]
-            fth = f_thermal(ei, kappa_span[si])
-            dof = [2 * n1, 2 * n1 + 1, 2 * n2, 2 * n2 + 1]
-            loads[dof] += fth
-        return loads
-
-    # Two-value mode: equal-length two segments (first half / second half)
-    if nvals == 2:
-        x_coords = system.mesh.x_coords
-        half = TOTAL_LEN / 2.0
-        kappa_left = scale * dT[0]
-        kappa_right = scale * dT[1]
-        for n1, n2, L, si in system.mesh.elements:
-            # element midpoint coordinate
-            x_mid = 0.5 * (x_coords[n1] + x_coords[n2])
-            kappa = kappa_left if x_mid < half else kappa_right
-            ei = system.span_ei[si]
-            fth = f_thermal(ei, kappa)
-            dof = [2 * n1, 2 * n1 + 1, 2 * n2, 2 * n2 + 1]
-            loads[dof] += fth
-        return loads
-
-    # Fallback: single uniform value across entire bridge, or raise
-    if nvals == 1:
-        kappa = scale * dT[0]
-        for n1, n2, L, si in system.mesh.elements:
-            ei = system.span_ei[si]
-            fth = f_thermal(ei, kappa)
-            dof = [2 * n1, 2 * n1 + 1, 2 * n2, 2 * n2 + 1]
-            loads[dof] += fth
-        return loads
-
-    raise ValueError(
-        f"Unsupported number of temperature values: {nvals}. "
-        "Provide 3 (per span) or 2 (half/half)."
-    )
+    return _mech.thermal_load_vector(system, thermal_state)
 
 
-def solve_with_system(system: StructuralSystem, thermal_state: ThermalState) -> Tuple[np.ndarray, np.ndarray]:
-    th = thermal_load_vector(system, thermal_state)
-    F = system.load_base - th
-    U = lu_solve((system.lu, system.piv), F)
-
-    reactions = []
-    for i, idx in enumerate(system.support_nodes):
-        ui = float(U[2 * idx])
-        Ri = -system.kv_values[i] * (ui - system.settlements[i]) / 1_000.0  # kN
-        reactions.append(Ri)
-
-    return U, np.array(reactions, dtype=float)
+def solve_linear(system: StructuralSystem, rhs: np.ndarray) -> np.ndarray:
+    return _mech.solve_linear(system, rhs)
 
 
-# ----------------- 前向求解 -----------------
-def solve_case(struct_params: StructuralParams, thermal_state: ThermalState) -> Tuple[np.ndarray, np.ndarray]:
-    """Solve the bridge response for the given structural parameters and thermal state."""
-
-    system = assemble_structural_system(struct_params)
-    return solve_with_system(system, thermal_state)
+def solve_with_system(system: StructuralSystem, thermal_state: ThermalState) -> tuple[np.ndarray, np.ndarray]:
+    return _mech.solve_with_system(system, thermal_state)
 
 
-def sample_19pt_deflection_rotation(ne_per_span: int, U: np.ndarray) -> Dict[str, float]:
-    """Match the 19 labelled sensor points and return deflection/rotation values."""
+def solve_case(struct_params: StructuralParams, thermal_state: ThermalState) -> tuple[np.ndarray, np.ndarray]:
+    return _mech.solve_case(struct_params, thermal_state)
 
-    _, def_mat, rot_mat = _sampling_matrices(ne_per_span)
-    displacements = np.asarray(U, dtype=float).reshape(-1)
-    deflections = def_mat @ displacements
-    rotations = rot_mat @ displacements
 
-    _, labs = _sensor_points_labels()
-    out: Dict[str, float] = {}
-    for idx, lab in enumerate(labs):
-        safe_lab = lab.replace("/", "_")
-        out[f"v_{safe_lab}_mm"] = float(deflections[idx])
-        out[f"theta_{safe_lab}_rad"] = float(rotations[idx])
-    return out
+def sample_19pt_deflection_rotation(ne_per_span: int, U: np.ndarray) -> dict[str, float]:
+    return _mech.sample_19pt_deflection_rotation(ne_per_span, U)
 
 
 def rotation_sampling_matrix(ne_per_span: int, rotation_keys: Sequence[str]) -> np.ndarray:
-    """Return a dense matrix mapping nodal DOFs to requested rotation channels."""
-
-    base_keys, _, rot_mat = _sampling_matrices(ne_per_span)
-    key_to_idx = {key: i for i, key in enumerate(base_keys)}
-    indices = [key_to_idx[k] for k in rotation_keys]
-    return rot_mat[indices]
+    return _mech.rotation_sampling_matrix(ne_per_span, rotation_keys)
 
 
 def evaluate_forward(struct_params: StructuralParams, thermal_state: ThermalState) -> BridgeResponse:
-    """Convenience wrapper returning reactions and 19-point sensor outputs."""
-
-    U, reactions = solve_case(struct_params, thermal_state)
-    sensor_map = sample_19pt_deflection_rotation(struct_params.ne_per_span, U)
-    return BridgeResponse(reactions_kN=reactions, sensor_map=sensor_map, displacements=U)
+    return _mech.evaluate_forward(struct_params, thermal_state)
 
 
 def evaluate_forward_with_system(system: StructuralSystem, thermal_state: ThermalState) -> BridgeResponse:
-    """Evaluate the forward model using a pre-assembled structural system."""
-
-    U, reactions = solve_with_system(system, thermal_state)
-    sensor_map = sample_19pt_deflection_rotation(system.struct_params.ne_per_span, U)
-    return BridgeResponse(reactions_kN=reactions, sensor_map=sensor_map, displacements=U)
+    return _mech.evaluate_forward_with_system(system, thermal_state)
 
 
 __all__ = [
@@ -391,4 +96,17 @@ __all__ = [
     "rotation_sampling_matrix",
     "TOTAL_LEN",
     "Q_UNIFORM",
+    "set_span_lengths_mm",
+    "get_span_lengths_mm",
+    "span_breakpoints_mm",
+    "total_length_mm",
+    "solve_linear",
+    "thermal_load_vector",
+    "build_mesh",
 ]
+
+
+def __getattr__(name: str):
+    if name == "TOTAL_LEN":
+        return _mech.total_length_mm()
+    raise AttributeError(name)
