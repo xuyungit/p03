@@ -22,6 +22,9 @@
 - 指定随机种子和输出文件：
   uv run python data/bridge_reaction_sampling.py --n 1000 --seed 123 --out data/augmented/bridge_lhs_1000.csv
 
+- 指定三跨长度（单位 m）：
+  uv run python data/bridge_reaction_sampling.py --span-lengths 30:60:30
+
 - 使用外部参数 CSV（禁用 LHS，逐行生成）：
   uv run python data/bridge_reaction_sampling.py --params data/custom_params.csv --out data/augmented/bridge_custom.csv
 """
@@ -29,6 +32,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Sequence, Tuple
@@ -42,9 +46,8 @@ E = 206_000.0                  # N/mm^2（钢）
 Iy = 3.154279e11               # mm^4
 EI_BASE = E * Iy               # N·mm^2
 
-LMM = 40_000.0                 # 每跨长度 mm
-SPAN_LEN = [LMM, LMM, LMM]
-TOTAL_LEN = float(sum(SPAN_LEN))
+DEFAULT_SPAN_MM = 40_000.0           # 默认三跨各 40 m（单位 mm）
+SPAN_LENGTHS_MM: List[float] = [DEFAULT_SPAN_MM, DEFAULT_SPAN_MM, DEFAULT_SPAN_MM]
 
 # 均布恒载（向下为负，单位 N/mm）
 Q_UNIFORM = -(12.0 + 20.0 + 29.64)
@@ -128,10 +131,42 @@ def f_thermal(ei: float, kappa: float) -> np.ndarray:
     return ei * kappa * np.array([0.0, -1.0, 0.0, +1.0], dtype=float)
 
 
+def set_span_lengths_mm(lengths_mm: Sequence[float]) -> None:
+    """更新三跨长度（单位 mm）。"""
+    if len(lengths_mm) != 3:
+        raise ValueError("span_lengths must contain exactly three values for A-B, B-C, C-D spans")
+    if any(L <= 0 for L in lengths_mm):
+        raise ValueError("span_lengths must be positive")
+    global SPAN_LENGTHS_MM
+    SPAN_LENGTHS_MM = [float(L) for L in lengths_mm]
+
+
+def span_breakpoints_mm() -> List[float]:
+    """返回各支座位置（单位 mm），顺序为 A/B/C/D。"""
+    pos = [0.0]
+    for L in SPAN_LENGTHS_MM:
+        pos.append(pos[-1] + L)
+    return pos
+
+
+def total_length_mm() -> float:
+    return float(span_breakpoints_mm()[-1])
+
+
+def parse_span_lengths_arg(text: str) -> List[float]:
+    tokens = [tok for tok in re.split(r"[:,;\s]+", text.strip()) if tok]
+    if len(tokens) != 3:
+        raise ValueError("需要三个跨度长度，例如 '40:40:40'")
+    try:
+        return [float(tok) for tok in tokens]
+    except ValueError as exc:  # pragma: no cover - CLI 级别错误
+        raise ValueError("跨度长度必须为数字") from exc
+
+
 def build_mesh(ne_per_span: int) -> Tuple[np.ndarray, List[Tuple[int, int, float, int]]]:
     elements: List[Tuple[int, int, float, int]] = []
     x = [0.0]
-    for si, L in enumerate(SPAN_LEN):
+    for si, L in enumerate(SPAN_LENGTHS_MM):
         dx = L / ne_per_span
         for _ in range(ne_per_span):
             n1 = len(x) - 1
@@ -165,6 +200,7 @@ def solve_case(params: CaseParams) -> Tuple[np.ndarray, np.ndarray, List[float]]
     dT_vals = tuple(params.dT_spans)
     nT = len(dT_vals)
     scale = (ALPHA / H_MM)
+    total_len = total_length_mm()
     if nT == 3:
         kappa_span = tuple(scale * np.array(dT_vals))
     elif nT == 2:
@@ -183,7 +219,7 @@ def solve_case(params: CaseParams) -> Tuple[np.ndarray, np.ndarray, List[float]]
             kappa = kappa_span[si]
         elif nT == 2:
             x_mid = 0.5 * (x_coords[n1] + x_coords[n2])
-            kappa = kappa_left if x_mid < TOTAL_LEN / 2.0 else kappa_right
+            kappa = kappa_left if x_mid < total_len / 2.0 else kappa_right
         else:
             kappa = kappa_uniform
         fth = f_thermal(ei, kappa)
@@ -192,7 +228,7 @@ def solve_case(params: CaseParams) -> Tuple[np.ndarray, np.ndarray, List[float]]
         F[dof] += fe - fth
 
     # 支座：位于 x = 0, L, 2L, 3L
-    support_x = [0.0, LMM, 2 * LMM, 3 * LMM]
+    support_x = span_breakpoints_mm()
     support_nodes: List[int] = []
     for xm in support_x:
         idx = int(np.argmin(np.abs(x_coords - xm)))
@@ -429,6 +465,7 @@ def generate_dataset(
         raise ValueError("sample_ids 长度与案例数量不一致")
 
     rows = []
+    bridge_length_mm = total_length_mm()
 
     for idx, c in enumerate(cases):
         if ne_per_span is not None:
@@ -440,7 +477,7 @@ def generate_dataset(
         else:
             sample_id = idx
 
-        load_kN = -c.q * TOTAL_LEN / 1_000.0  # 竖向总荷载（正数）
+        load_kN = -c.q * bridge_length_mm / 1_000.0  # 竖向总荷载（正数）
 
         U, R, Rlist = solve_case(c)
 
@@ -501,26 +538,16 @@ def sample_19pt_deflection_rotation(params: CaseParams, U: np.ndarray) -> dict:
     def sensor_points_labels() -> Tuple[List[float], List[str]]:
         pts: List[float] = []
         labs: List[str] = []
-        # A
-        pts.append(0.0); labs.append("A")
-        # S1
-        for k in range(1, 6):
-            pts.append(k / 6.0 * LMM)
-            labs.append(f"S1-{k}/6L")
-        # B
-        pts.append(1.0 * LMM); labs.append("B")
-        # S2
-        for k in range(1, 6):
-            pts.append(LMM + k / 6.0 * LMM)
-            labs.append(f"S2-{k}/6L")
-        # C
-        pts.append(2.0 * LMM); labs.append("C")
-        # S3
-        for k in range(1, 6):
-            pts.append(2 * LMM + k / 6.0 * LMM)
-            labs.append(f"S3-{k}/6L")
-        # D
-        pts.append(3.0 * LMM); labs.append("D")
+        support_labels = ["A", "B", "C", "D"]
+        support_positions = span_breakpoints_mm()
+        pts.append(support_positions[0]); labs.append(support_labels[0])
+        for si, span_len in enumerate(SPAN_LENGTHS_MM):
+            start = support_positions[si]
+            for k in range(1, 6):
+                pts.append(start + k / 6.0 * span_len)
+                labs.append(f"S{si + 1}-{k}/6L")
+            pts.append(support_positions[si + 1])
+            labs.append(support_labels[si + 1])
         return pts, labs
 
     def find_element(x: float) -> Tuple[int, float, float]:
@@ -593,10 +620,22 @@ def main():
         choices=[2, 3],
         help="温度分段数：3=每跨；2=按全长50/50",
     )
+    parser.add_argument(
+        "--span-lengths",
+        type=str,
+        default=None,
+        help="三跨长度（米），格式如 '40:40:40' 或 '30:60:30'",
+    )
     args = parser.parse_args()
 
     out_path = Path(args.out)
     ne_override = args.ne
+    if args.span_lengths:
+        try:
+            spans_m = parse_span_lengths_arg(args.span_lengths)
+        except ValueError as exc:
+            parser.error(str(exc))
+        set_span_lengths_mm([L * 1_000.0 for L in spans_m])
 
     if args.params:
         param_path = Path(args.params)
