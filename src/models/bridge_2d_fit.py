@@ -882,28 +882,10 @@ def print_fitting_results(
           f"{const_params['kv_factor_c']:.4f}, "
           f"{const_params['kv_factor_d']:.4f})")
     
-    # Compare parameters
-    true_settlements = np.array([
-        const_params['settlement_a_mm'],
-        const_params['settlement_b_mm'],
-        const_params['settlement_c_mm'],
-        const_params['settlement_d_mm'],
-    ])
+    # Compare parameters (使用统一函数提取真实参数)
+    true_settlements, true_ei, true_kv = extract_true_parameters(const_params)
     fitted_settlements = np.array(sp.settlements)
-    
-    true_ei = np.array([
-        const_params['ei_factor_s1'],
-        const_params['ei_factor_s2'],
-        const_params['ei_factor_s3'],
-    ])
     fitted_ei = np.array(sp.ei_factors)
-    
-    true_kv = np.array([
-        const_params['kv_factor_a'],
-        const_params['kv_factor_b'],
-        const_params['kv_factor_c'],
-        const_params['kv_factor_d'],
-    ])
     fitted_kv = np.array(sp.kv_factors)
     
     # Temperature RMSE calculation
@@ -919,33 +901,10 @@ def print_fitting_results(
     # Residuals by measurement type
     print(f"\n残差统计 ({len(result['thermal_states'])} 工况):")
     
-    if result['reaction_residuals'] is not None:
-        reaction_res = result['reaction_residuals']
-        print(f"\n  反力残差:")
-        print(f"    RMSE:     {np.sqrt(np.mean(reaction_res**2)):.6e} kN")
-        print(f"    最大残差: {np.max(np.abs(reaction_res)):.6e} kN")
-        print(f"    平均残差: {np.mean(np.abs(reaction_res)):.6e} kN")
-    
-    if result['displacement_residuals'] is not None:
-        disp_res = result['displacement_residuals']
-        print(f"\n  位移残差:")
-        print(f"    RMSE:     {np.sqrt(np.mean(disp_res**2)):.6e} mm")
-        print(f"    最大残差: {np.max(np.abs(disp_res)):.6e} mm")
-        print(f"    平均残差: {np.mean(np.abs(disp_res)):.6e} mm")
-    
-    if result['rotation_residuals'] is not None:
-        rot_res = result['rotation_residuals']
-        print(f"\n  转角残差:")
-        print(f"    RMSE:     {np.sqrt(np.mean(rot_res**2)):.6e} rad")
-        print(f"    最大残差: {np.max(np.abs(rot_res)):.6e} rad")
-        print(f"    平均残差: {np.mean(np.abs(rot_res)):.6e} rad")
-    
-    if result['span_rotation_residuals'] is not None:
-        span_rot_res = result['span_rotation_residuals']
-        print(f"\n  跨中转角残差:")
-        print(f"    RMSE:     {np.sqrt(np.mean(span_rot_res**2)):.6e} rad")
-        print(f"    最大残差: {np.max(np.abs(span_rot_res)):.6e} rad")
-        print(f"    平均残差: {np.mean(np.abs(span_rot_res)):.6e} rad")
+    print_residual_stats(result['reaction_residuals'], "反力", "kN")
+    print_residual_stats(result['displacement_residuals'], "位移", "mm")
+    print_residual_stats(result['rotation_residuals'], "转角", "rad")
+    print_residual_stats(result['span_rotation_residuals'], "跨中转角", "rad")
     
     # Temperature examples
     print(f"\n温度梯度示例 (前5个工况):")
@@ -985,23 +944,18 @@ def print_fitting_results(
     print(f"    RMSE:     {np.sqrt(np.mean(reaction_forward_res**2)):.6e} kN")
     print(f"    最大残差: {np.max(np.abs(reaction_forward_res)):.6e} kN")
     
+    # 使用统一函数处理其他测量类型的正模型残差
     if displacements_matrix is not None:
         disp_forward_res = recomputed_displacements - displacements_matrix
-        print(f"  位移:")
-        print(f"    RMSE:     {np.sqrt(np.mean(disp_forward_res**2)):.6e} mm")
-        print(f"    最大残差: {np.max(np.abs(disp_forward_res)):.6e} mm")
+        print_residual_stats(disp_forward_res, "位移", "mm")
     
     if rotations_matrix is not None:
         rot_forward_res = recomputed_rotations - rotations_matrix
-        print(f"  转角:")
-        print(f"    RMSE:     {np.sqrt(np.mean(rot_forward_res**2)):.6e} rad")
-        print(f"    最大残差: {np.max(np.abs(rot_forward_res)):.6e} rad")
+        print_residual_stats(rot_forward_res, "转角", "rad")
     
     if span_rotations_matrix is not None:
         span_rot_forward_res = recomputed_span_rotations - span_rotations_matrix
-        print(f"  跨中转角:")
-        print(f"    RMSE:     {np.sqrt(np.mean(span_rot_forward_res**2)):.6e} rad")
-        print(f"    最大残差: {np.max(np.abs(span_rot_forward_res)):.6e} rad")
+        print_residual_stats(span_rot_forward_res, "跨中转角", "rad")
     
     # Compare optimizer residuals vs forward residuals for reactions
     if result['reaction_residuals'] is not None:
@@ -1032,6 +986,167 @@ def print_fitting_results(
     
     return recomputed_reactions, recomputed_displacements, recomputed_rotations, recomputed_span_rotations, reaction_forward_res
 
+
+# ============================================================================
+# Helper Functions for Measurement Matrix Extraction
+# ============================================================================
+
+def extract_measurement_matrix(
+    df: pd.DataFrame,
+    col_names: List[str],
+    measurement_type: str,
+    enabled: bool,
+    weight: float
+) -> Tuple[Optional[np.ndarray], bool]:
+    """提取测量矩阵的通用函数，消除重复代码。
+    
+    Args:
+        df: 数据DataFrame
+        col_names: 列名列表
+        measurement_type: 测量类型名称（用于日志输出）
+        enabled: 是否启用该测量类型
+        weight: 测量权重
+    
+    Returns:
+        (matrix, enabled): 测量矩阵和更新后的启用状态
+    """
+    if not enabled:
+        return None, False
+    
+    if all(col in df.columns for col in col_names):
+        matrix = df[col_names].to_numpy()
+        print(f"\n✓ 使用{measurement_type} (权重={weight})")
+        return matrix, True
+    else:
+        print(f"\n✗ 警告: 请求使用{measurement_type}但数据中不包含，将跳过{measurement_type}约束")
+        return None, False
+
+
+def setup_measurement_matrices(
+    df: pd.DataFrame,
+    measurement_config: MeasurementConfig
+) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray], MeasurementConfig]:
+    """设置所有测量矩阵，统一处理逻辑。
+    
+    Args:
+        df: 数据DataFrame
+        measurement_config: 测量配置
+    
+    Returns:
+        (reactions_matrix, displacements_matrix, rotations_matrix, 
+         span_rotations_matrix, updated_config)
+    """
+    # 反力矩阵（总是需要）
+    reactions_matrix = df[ColumnNames.REACTIONS].to_numpy()
+    
+    # 位移矩阵
+    displacements_matrix, use_displacements = extract_measurement_matrix(
+        df, ColumnNames.DISPLACEMENTS, "支座位移测量值",
+        measurement_config.use_displacements, measurement_config.displacement_weight
+    )
+    
+    # 转角矩阵
+    rotations_matrix, use_rotations = extract_measurement_matrix(
+        df, ColumnNames.ROTATIONS, "支座转角测量值",
+        measurement_config.use_rotations, measurement_config.rotation_weight
+    )
+    
+    # 跨中转角矩阵
+    span_rotations_matrix, use_span_rotations = extract_measurement_matrix(
+        df, ColumnNames.SPAN_ROTATIONS, "跨中转角测量值",
+        measurement_config.use_span_rotations, measurement_config.span_rotation_weight
+    )
+    
+    # 更新配置（如果某些测量不可用）
+    updated_config = MeasurementConfig(
+        use_reactions=True,
+        use_displacements=use_displacements,
+        use_rotations=use_rotations,
+        use_span_rotations=use_span_rotations,
+        displacement_weight=measurement_config.displacement_weight,
+        rotation_weight=measurement_config.rotation_weight,
+        span_rotation_weight=measurement_config.span_rotation_weight,
+        auto_normalize=measurement_config.auto_normalize,
+    )
+    
+    return reactions_matrix, displacements_matrix, rotations_matrix, span_rotations_matrix, updated_config
+
+
+# ============================================================================
+# Helper Functions for Residual Statistics
+# ============================================================================
+
+def print_residual_stats(residuals: Optional[np.ndarray], name: str, unit: str) -> None:
+    """打印残差统计信息的通用函数。
+    
+    Args:
+        residuals: 残差数组
+        name: 残差类型名称
+        unit: 单位
+    """
+    if residuals is None:
+        return
+    
+    print(f"\n  {name}残差:")
+    print(f"    RMSE:     {np.sqrt(np.mean(residuals**2)):.6e} {unit}")
+    print(f"    最大残差: {np.max(np.abs(residuals)):.6e} {unit}")
+    print(f"    平均残差: {np.mean(np.abs(residuals)):.6e} {unit}")
+
+
+def add_residual_columns(
+    df: pd.DataFrame,
+    residuals: Optional[np.ndarray],
+    column_prefix: str,
+    n_cols: int
+) -> None:
+    """添加残差列到DataFrame的通用函数。
+    
+    Args:
+        df: 输出DataFrame
+        residuals: 残差数组 (n_cases, n_cols)
+        column_prefix: 列名前缀
+        n_cols: 列数
+    """
+    if residuals is not None:
+        for i in range(n_cols):
+            df[f'{column_prefix}{i+1}'] = residuals[:, i]
+
+
+def extract_true_parameters(const_params: dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """从常数参数字典提取真实参数数组。
+    
+    Args:
+        const_params: 常数参数字典
+    
+    Returns:
+        (true_settlements, true_ei, true_kv): 真实参数数组
+    """
+    true_settlements = np.array([
+        const_params['settlement_a_mm'],
+        const_params['settlement_b_mm'],
+        const_params['settlement_c_mm'],
+        const_params['settlement_d_mm'],
+    ])
+    
+    true_ei = np.array([
+        const_params['ei_factor_s1'],
+        const_params['ei_factor_s2'],
+        const_params['ei_factor_s3'],
+    ])
+    
+    true_kv = np.array([
+        const_params['kv_factor_a'],
+        const_params['kv_factor_b'],
+        const_params['kv_factor_c'],
+        const_params['kv_factor_d'],
+    ])
+    
+    return true_settlements, true_ei, true_kv
+
+
+# ============================================================================
+# Main Entry Point
+# ============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
@@ -1091,35 +1206,10 @@ def main():
         args.data, args.max_samples, measurement_config
     )
     
-    # Extract measurement matrices based on what's available and requested
-    reactions_matrix = df[ColumnNames.REACTIONS].to_numpy()
-    
-    displacements_matrix = None
-    if measurement_config.use_displacements:
-        if all(col in df.columns for col in ColumnNames.DISPLACEMENTS):
-            displacements_matrix = df[ColumnNames.DISPLACEMENTS].to_numpy()
-            print(f"\n✓ 使用支座位移测量值 (权重={measurement_config.displacement_weight})")
-        else:
-            print(f"\n✗ 警告: 请求使用位移但数据中不包含，将跳过位移约束")
-            measurement_config.use_displacements = False
-    
-    rotations_matrix = None
-    if measurement_config.use_rotations:
-        if all(col in df.columns for col in ColumnNames.ROTATIONS):
-            rotations_matrix = df[ColumnNames.ROTATIONS].to_numpy()
-            print(f"\n✓ 使用支座转角测量值 (权重={measurement_config.rotation_weight})")
-        else:
-            print(f"\n✗ 警告: 请求使用转角但数据中不包含，将跳过转角约束")
-            measurement_config.use_rotations = False
-    
-    span_rotations_matrix = None
-    if measurement_config.use_span_rotations:
-        if all(col in df.columns for col in ColumnNames.SPAN_ROTATIONS):
-            span_rotations_matrix = df[ColumnNames.SPAN_ROTATIONS].to_numpy()
-            print(f"\n✓ 使用跨中转角测量值 (权重={measurement_config.span_rotation_weight})")
-        else:
-            print(f"\n✗ 警告: 请求使用跨中转角但数据中不包含，将跳过跨中转角约束")
-            measurement_config.use_span_rotations = False
+    # Extract measurement matrices (unified function to eliminate duplication)
+    reactions_matrix, displacements_matrix, rotations_matrix, span_rotations_matrix, measurement_config = setup_measurement_matrices(
+        df, measurement_config
+    )
     
     # Temperature columns detection
     requested_segments = int(args.temp_segments)
@@ -1230,41 +1320,26 @@ def main():
         for i, name in enumerate(span_names):
             output_df[f'theta_{name}_recomputed_rad'] = recomputed_span_rotations[:, i]
         
-        # Optimizer residuals
-        if result['reaction_residuals'] is not None:
-            for i in range(4):
-                output_df[f'residual_optimizer_R{i+1}'] = result['reaction_residuals'][:, i]
+        # Optimizer residuals (使用统一函数消除重复)
+        add_residual_columns(output_df, result['reaction_residuals'], 'residual_optimizer_R', 4)
+        add_residual_columns(output_df, result['displacement_residuals'], 'residual_optimizer_v', 4)
+        add_residual_columns(output_df, result['rotation_residuals'], 'residual_optimizer_theta', 4)
+        add_residual_columns(output_df, result['span_rotation_residuals'], 'residual_optimizer_span_theta', 3)
         
-        if result['displacement_residuals'] is not None:
-            for i in range(4):
-                output_df[f'residual_optimizer_v{i+1}'] = result['displacement_residuals'][:, i]
-        
-        if result['rotation_residuals'] is not None:
-            for i in range(4):
-                output_df[f'residual_optimizer_theta{i+1}'] = result['rotation_residuals'][:, i]
-        
-        if result['span_rotation_residuals'] is not None:
-            for i in range(3):
-                output_df[f'residual_optimizer_span_theta{i+1}'] = result['span_rotation_residuals'][:, i]
-        
-        # Forward model residuals
-        for i in range(4):
-            output_df[f'residual_forward_R{i+1}'] = reaction_forward_res[:, i]
+        # Forward model residuals (使用统一函数消除重复)
+        add_residual_columns(output_df, reaction_forward_res, 'residual_forward_R', 4)
         
         if displacements_matrix is not None:
             disp_forward_res = recomputed_displacements - displacements_matrix
-            for i in range(4):
-                output_df[f'residual_forward_v{i+1}'] = disp_forward_res[:, i]
+            add_residual_columns(output_df, disp_forward_res, 'residual_forward_v', 4)
         
         if rotations_matrix is not None:
             rot_forward_res = recomputed_rotations - rotations_matrix
-            for i in range(4):
-                output_df[f'residual_forward_theta{i+1}'] = rot_forward_res[:, i]
+            add_residual_columns(output_df, rot_forward_res, 'residual_forward_theta', 4)
         
         if span_rotations_matrix is not None:
             span_rot_forward_res = recomputed_span_rotations - span_rotations_matrix
-            for i in range(3):
-                output_df[f'residual_forward_span_theta{i+1}'] = span_rot_forward_res[:, i]
+            add_residual_columns(output_df, span_rot_forward_res, 'residual_forward_span_theta', 3)
         
         output_df.to_csv(args.output, index=False)
         print(f"\n结果已保存到: {args.output}")
