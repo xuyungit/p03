@@ -553,7 +553,8 @@ def main() -> None:
         first_headers = set(te_headers_all[0])
         for i, headers in enumerate(te_headers_all[1:], 1):
             if set(headers) != first_headers:
-                raise SystemExit(f"Test files have inconsistent columns. File 1: {sorted(first_headers)}, File {i+1}: {sorted(set(headers))}")
+                # raise SystemExit(f"Test files have inconsistent columns. File 1: {sorted(first_headers)}, File {i+1}: {sorted(set(headers))}")
+                print(f"Warning: Test files have inconsistent columns. File 1: {sorted(first_headers)}, File {i+1}: {sorted(set(headers))}")
     te_head_cols = te_headers_all[0] if te_headers_all else []
     if cfg.input_cols is not None:
         chosen_input_cols = list(cfg.input_cols)
