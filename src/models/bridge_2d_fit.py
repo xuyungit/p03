@@ -83,6 +83,60 @@ from models.bridge_forward_model import (
 )
 
 
+# ============================================================================
+# Constants and Configuration Classes
+# ============================================================================
+
+class ColumnNames:
+    """数据列名常量"""
+    # 测量值列名
+    REACTIONS = ['R_a_kN', 'R_b_kN', 'R_c_kN', 'R_d_kN']
+    DISPLACEMENTS = ['v_A_mm', 'v_B_mm', 'v_C_mm', 'v_D_mm']
+    ROTATIONS = ['theta_A_rad', 'theta_B_rad', 'theta_C_rad', 'theta_D_rad']
+    SPAN_ROTATIONS = ['theta_S1-5_6L_rad', 'theta_S2-4_6L_rad', 'theta_S3-5_6L_rad']
+    
+    # 温度列名
+    TEMPS_3_SPAN = ['dT_s1_C', 'dT_s2_C', 'dT_s3_C']
+    TEMPS_2_SEG = ['dT_left_C', 'dT_right_C']
+    
+    # 结构参数列名
+    SPAN_LENGTHS = ['span_length_s1_mm', 'span_length_s2_mm', 'span_length_s3_mm']
+    SETTLEMENTS = ['settlement_a_mm', 'settlement_b_mm', 'settlement_c_mm', 'settlement_d_mm']
+    EI_FACTORS = ['ei_factor_s1', 'ei_factor_s2', 'ei_factor_s3']
+    KV_FACTORS = ['kv_factor_a', 'kv_factor_b', 'kv_factor_c', 'kv_factor_d']
+    
+    # 其他
+    UNIFORM_LOAD = 'uniform_load_N_per_mm'
+    SAMPLE_ID = 'sample_id'
+
+
+@dataclass
+class OptimizationConfig:
+    """优化配置参数"""
+    # 参数边界
+    settlement_lower: float = -20.0
+    settlement_upper: float = 20.0
+    ei_factor_lower: float = 0.3
+    ei_factor_upper: float = 1.5
+    kv_factor_lower: float = 0.1
+    kv_factor_upper: float = 3.0
+    temp_gradient_lower: float = -10.0
+    temp_gradient_upper: float = 20.0
+    temp_gradient_initial: float = 10.0
+    
+    # 正则化阈值
+    temp_spatial_diff_thresh: float = 3.0
+    temp_temporal_diff_thresh: float = 1.0
+    
+    # 优化器设置
+    ftol: float = 1e-8
+    gtol: float = 1e-8
+    xtol: float = 1e-12
+    
+    # 数值稳定性
+    min_scale_threshold: float = 1e-10
+
+
 @dataclass
 class MeasurementConfig:
     """Configuration for which measurements to use in fitting.
@@ -180,15 +234,10 @@ def load_multi_case_data(
     
     # Auto-detect available measurements if config not provided
     if measurement_config is None:
-        reaction_cols = ['R_a_kN', 'R_b_kN', 'R_c_kN', 'R_d_kN']
-        displacement_cols = ['v_A_mm', 'v_B_mm', 'v_C_mm', 'v_D_mm']
-        rotation_cols = ['theta_A_rad', 'theta_B_rad', 'theta_C_rad', 'theta_D_rad']
-        span_rotation_cols = ['theta_S1-5_6L_rad', 'theta_S2-4_6L_rad', 'theta_S3-5_6L_rad']
-        
-        has_reactions = all(col in df.columns for col in reaction_cols)
-        has_displacements = all(col in df.columns for col in displacement_cols)
-        has_rotations = all(col in df.columns for col in rotation_cols)
-        has_span_rotations = all(col in df.columns for col in span_rotation_cols)
+        has_reactions = all(col in df.columns for col in ColumnNames.REACTIONS)
+        has_displacements = all(col in df.columns for col in ColumnNames.DISPLACEMENTS)
+        has_rotations = all(col in df.columns for col in ColumnNames.ROTATIONS)
+        has_span_rotations = all(col in df.columns for col in ColumnNames.SPAN_ROTATIONS)
         
         print(f"\n可用测量数据:")
         print(f"  反力 (R_a~R_d): {'✓' if has_reactions else '✗'}")
@@ -205,11 +254,10 @@ def load_multi_case_data(
         )
         print(f"\n默认使用: 仅反力")
     
-    span_cols = ["span_length_s1_mm", "span_length_s2_mm", "span_length_s3_mm"]
-    has_span_cols = all(col in df.columns for col in span_cols)
+    has_span_cols = all(col in df.columns for col in ColumnNames.SPAN_LENGTHS)
     if has_span_cols:
-        spans_mm = tuple(float(df[col].iloc[0]) for col in span_cols)
-        for i, col in enumerate(span_cols):
+        spans_mm = tuple(float(df[col].iloc[0]) for col in ColumnNames.SPAN_LENGTHS)
+        for i, col in enumerate(ColumnNames.SPAN_LENGTHS):
             if not np.isclose(df[col], spans_mm[i]).all():
                 raise ValueError("span_length_x_mm 列应为常数")
         set_span_lengths_mm(spans_mm)
@@ -221,13 +269,13 @@ def load_multi_case_data(
         print("  未检测到跨度列，使用默认 40:40:40 m")
 
     # Verify structural parameters are constant
-    struct_cols = [
-        'settlement_a_mm', 'settlement_b_mm', 'settlement_c_mm', 'settlement_d_mm',
-        'ei_factor_s1', 'ei_factor_s2', 'ei_factor_s3',
-        'kv_factor_a', 'kv_factor_b', 'kv_factor_c', 'kv_factor_d',
-    ]
+    struct_cols = (
+        ColumnNames.SETTLEMENTS +
+        ColumnNames.EI_FACTORS +
+        ColumnNames.KV_FACTORS
+    )
     if has_span_cols:
-        struct_cols.extend(span_cols)
+        struct_cols.extend(ColumnNames.SPAN_LENGTHS)
     
     const_params = {}
     for col in struct_cols:
@@ -377,6 +425,7 @@ class VectorizedMultiCaseFitter:
         displacements_matrix: Optional[np.ndarray] = None,  # shape: (n_cases, 4)
         rotations_matrix: Optional[np.ndarray] = None,  # shape: (n_cases, 4)
         span_rotations_matrix: Optional[np.ndarray] = None,  # shape: (n_cases, 3)
+        opt_config: Optional[OptimizationConfig] = None,
     ):
         """
         Args:
@@ -393,6 +442,7 @@ class VectorizedMultiCaseFitter:
             rotations_matrix: Measured rotations, shape (n_cases, 4) if using
             span_rotations_matrix: Measured span rotations, shape (n_cases, 3) if using
                                   [theta_S1-5_6L, theta_S2-4_6L, theta_S3-5_6L]
+            opt_config: Optimization configuration (uses defaults if None)
         """
         self.reactions_matrix = reactions_matrix
         self.n_cases = reactions_matrix.shape[0]
@@ -405,6 +455,9 @@ class VectorizedMultiCaseFitter:
         if temp_segments not in (2, 3):
             raise ValueError("temp_segments must be 2 or 3")
         self.temp_segments = temp_segments
+        
+        # Optimization configuration
+        self.opt_config = opt_config if opt_config is not None else OptimizationConfig()
         
         # Measurement configuration
         if measurement_config is None:
@@ -440,13 +493,13 @@ class VectorizedMultiCaseFitter:
         )
         
         # Avoid division by zero
-        if self.reaction_scale < 1e-10:
+        if self.reaction_scale < self.opt_config.min_scale_threshold:
             self.reaction_scale = 1.0
-        if self.displacement_scale < 1e-10:
+        if self.displacement_scale < self.opt_config.min_scale_threshold:
             self.displacement_scale = 1.0
-        if self.rotation_scale < 1e-10:
+        if self.rotation_scale < self.opt_config.min_scale_threshold:
             self.rotation_scale = 1.0
-        if self.span_rotation_scale < 1e-10:
+        if self.span_rotation_scale < self.opt_config.min_scale_threshold:
             self.span_rotation_scale = 1.0
         
         # Cache
@@ -512,31 +565,31 @@ class VectorizedMultiCaseFitter:
             if self.fix_first_settlement:
                 # Only optimize settlements B, C, D (A is fixed at 0.0)
                 x0_list.extend([0.0, 0.0, 0.0])
-                lower_list.extend([-20.0] * 3)
-                upper_list.extend([20.0] * 3)
+                lower_list.extend([self.opt_config.settlement_lower] * 3)
+                upper_list.extend([self.opt_config.settlement_upper] * 3)
             else:
                 # Optimize all 4 settlements
                 x0_list.extend([0.0, 0.0, 0.0, 0.0])
-                lower_list.extend([-20.0] * 4)
-                upper_list.extend([20.0] * 4)
+                lower_list.extend([self.opt_config.settlement_lower] * 4)
+                upper_list.extend([self.opt_config.settlement_upper] * 4)
             
             # EI factors (3)
             x0_list.extend([1.0, 1.0, 1.0])
-            lower_list.extend([0.3] * 3)
-            upper_list.extend([1.5] * 3)
+            lower_list.extend([self.opt_config.ei_factor_lower] * 3)
+            upper_list.extend([self.opt_config.ei_factor_upper] * 3)
             
             # Kv factors (4) - only if not fixed
             if self.fixed_kv_factors is None:
                 x0_list.extend([1.0, 1.0, 1.0, 1.0])
-                lower_list.extend([0.1] * 4)
-                upper_list.extend([3.0] * 4)
+                lower_list.extend([self.opt_config.kv_factor_lower] * 4)
+                upper_list.extend([self.opt_config.kv_factor_upper] * 4)
         
         # Temperature gradients (nT per case)
         nT = self.temp_segments
         for _ in range(self.n_cases):
-            x0_list.extend([10.0] * nT)
-            lower_list.extend([-10.0] * nT)
-            upper_list.extend([20.0] * nT)
+            x0_list.extend([self.opt_config.temp_gradient_initial] * nT)
+            lower_list.extend([self.opt_config.temp_gradient_lower] * nT)
+            upper_list.extend([self.opt_config.temp_gradient_upper] * nT)
         
         x0 = np.array(x0_list)
         lower = np.array(lower_list)
@@ -671,28 +724,26 @@ class VectorizedMultiCaseFitter:
         physics_residuals = np.concatenate(residuals_list)
 
         # 2. Spatial regularization
-        temp_spatial_diff_thresh = 3.0
         if self.temp_spatial_weight > 0:
             if self.temp_segments == 3:
                 diff_01 = dT_matrix[:, 1] - dT_matrix[:, 0]
                 diff_12 = dT_matrix[:, 2] - dT_matrix[:, 1]
-                spatial_penalty_01 = np.maximum(0.0, np.abs(diff_01) - temp_spatial_diff_thresh) * self.temp_spatial_weight
-                spatial_penalty_12 = np.maximum(0.0, np.abs(diff_12) - temp_spatial_diff_thresh) * self.temp_spatial_weight
+                spatial_penalty_01 = np.maximum(0.0, np.abs(diff_01) - self.opt_config.temp_spatial_diff_thresh) * self.temp_spatial_weight
+                spatial_penalty_12 = np.maximum(0.0, np.abs(diff_12) - self.opt_config.temp_spatial_diff_thresh) * self.temp_spatial_weight
                 self._spatial_residuals[0::2] = spatial_penalty_01
                 self._spatial_residuals[1::2] = spatial_penalty_12
             else:
                 # Only one adjacent pair per case in 2-seg mode
                 diff = dT_matrix[:, 1] - dT_matrix[:, 0]
-                spatial_penalty = np.maximum(0.0, np.abs(diff) - temp_spatial_diff_thresh) * self.temp_spatial_weight
+                spatial_penalty = np.maximum(0.0, np.abs(diff) - self.opt_config.temp_spatial_diff_thresh) * self.temp_spatial_weight
                 self._spatial_residuals[:] = spatial_penalty
         else:
             self._spatial_residuals[:] = 0.0
 
         # 3. Temporal regularization
-        temp_temporal_diff_thresh = 1.0
         if self.temp_temporal_weight > 0:
             dT_diff = dT_matrix[1:, :] - dT_matrix[:-1, :]
-            temporal_penalty = np.maximum(0.0, np.abs(dT_diff) - temp_temporal_diff_thresh) * self.temp_temporal_weight
+            temporal_penalty = np.maximum(0.0, np.abs(dT_diff) - self.opt_config.temp_temporal_diff_thresh) * self.temp_temporal_weight
             self._temporal_residuals[:] = temporal_penalty.ravel()
         else:
             self._temporal_residuals[:] = 0.0
@@ -725,9 +776,9 @@ class VectorizedMultiCaseFitter:
             x0,
             bounds=bounds,
             args=(fit_struct,),
-            ftol=1e-8,
-            gtol=1e-8,
-            xtol=1e-12,
+            ftol=self.opt_config.ftol,
+            gtol=self.opt_config.gtol,
+            xtol=self.opt_config.xtol,
             max_nfev=maxiter * 1,
             verbose=verbose,
         )
@@ -1041,13 +1092,12 @@ def main():
     )
     
     # Extract measurement matrices based on what's available and requested
-    reactions_matrix = df[['R_a_kN', 'R_b_kN', 'R_c_kN', 'R_d_kN']].to_numpy()
+    reactions_matrix = df[ColumnNames.REACTIONS].to_numpy()
     
     displacements_matrix = None
     if measurement_config.use_displacements:
-        disp_cols = ['v_A_mm', 'v_B_mm', 'v_C_mm', 'v_D_mm']
-        if all(col in df.columns for col in disp_cols):
-            displacements_matrix = df[disp_cols].to_numpy()
+        if all(col in df.columns for col in ColumnNames.DISPLACEMENTS):
+            displacements_matrix = df[ColumnNames.DISPLACEMENTS].to_numpy()
             print(f"\n✓ 使用支座位移测量值 (权重={measurement_config.displacement_weight})")
         else:
             print(f"\n✗ 警告: 请求使用位移但数据中不包含，将跳过位移约束")
@@ -1055,9 +1105,8 @@ def main():
     
     rotations_matrix = None
     if measurement_config.use_rotations:
-        rot_cols = ['theta_A_rad', 'theta_B_rad', 'theta_C_rad', 'theta_D_rad']
-        if all(col in df.columns for col in rot_cols):
-            rotations_matrix = df[rot_cols].to_numpy()
+        if all(col in df.columns for col in ColumnNames.ROTATIONS):
+            rotations_matrix = df[ColumnNames.ROTATIONS].to_numpy()
             print(f"\n✓ 使用支座转角测量值 (权重={measurement_config.rotation_weight})")
         else:
             print(f"\n✗ 警告: 请求使用转角但数据中不包含，将跳过转角约束")
@@ -1065,9 +1114,8 @@ def main():
     
     span_rotations_matrix = None
     if measurement_config.use_span_rotations:
-        span_rot_cols = ['theta_S1-5_6L_rad', 'theta_S2-4_6L_rad', 'theta_S3-5_6L_rad']
-        if all(col in df.columns for col in span_rot_cols):
-            span_rotations_matrix = df[span_rot_cols].to_numpy()
+        if all(col in df.columns for col in ColumnNames.SPAN_ROTATIONS):
+            span_rotations_matrix = df[ColumnNames.SPAN_ROTATIONS].to_numpy()
             print(f"\n✓ 使用跨中转角测量值 (权重={measurement_config.span_rotation_weight})")
         else:
             print(f"\n✗ 警告: 请求使用跨中转角但数据中不包含，将跳过跨中转角约束")
@@ -1075,29 +1123,27 @@ def main():
     
     # Temperature columns detection
     requested_segments = int(args.temp_segments)
-    cols3 = ['dT_s1_C', 'dT_s2_C', 'dT_s3_C']
-    cols2 = ['dT_left_C', 'dT_right_C']
     if requested_segments == 3:
-        if all(c in df.columns for c in cols3):
-            true_temps = df[cols3].to_numpy()
+        if all(c in df.columns for c in ColumnNames.TEMPS_3_SPAN):
+            true_temps = df[ColumnNames.TEMPS_3_SPAN].to_numpy()
             actual_segments = 3
-        elif all(c in df.columns for c in cols2):
+        elif all(c in df.columns for c in ColumnNames.TEMPS_2_SEG):
             print('提示: 数据文件仅含2段温度列，自动切换为2段模式。')
-            true_temps = df[cols2].to_numpy()
+            true_temps = df[ColumnNames.TEMPS_2_SEG].to_numpy()
             actual_segments = 2
         else:
             raise SystemExit('缺少温度列：需要 dT_s1_C/dT_s2_C/dT_s3_C 或 dT_left_C/dT_right_C')
     else:
-        if all(c in df.columns for c in cols2):
-            true_temps = df[cols2].to_numpy()
+        if all(c in df.columns for c in ColumnNames.TEMPS_2_SEG):
+            true_temps = df[ColumnNames.TEMPS_2_SEG].to_numpy()
             actual_segments = 2
-        elif all(c in df.columns for c in cols3):
+        elif all(c in df.columns for c in ColumnNames.TEMPS_3_SPAN):
             print('提示: 数据文件仅含3段温度列，自动切换为3段模式。')
-            true_temps = df[cols3].to_numpy()
+            true_temps = df[ColumnNames.TEMPS_3_SPAN].to_numpy()
             actual_segments = 3
         else:
             raise SystemExit('缺少温度列：需要 dT_left_C/dT_right_C 或 dT_s1_C/dT_s2_C/dT_s3_C')
-    uniform_load = float(df['uniform_load_N_per_mm'].iloc[0])
+    uniform_load = float(df[ColumnNames.UNIFORM_LOAD].iloc[0])
     
     # Parse fixed KV if provided
     fixed_kv_factors = None
