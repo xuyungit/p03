@@ -11,6 +11,7 @@ from .fitter import VectorizedMultiCaseFitter
 from .measurements import setup_measurement_matrices
 from .residuals import add_residual_columns
 from .results import print_fitting_results
+from .temperature_models import FourierTemperatureBasis
 
 
 def main():
@@ -31,6 +32,20 @@ def main():
     parser.add_argument('--output', type=Path, help='输出CSV文件')
     parser.add_argument('--temp-segments', type=int, default=3, choices=[2, 3],
                         help='温度分段数：3=每跨；2=按全长50/50')
+    parser.add_argument('--temp-basis', choices=['raw', 'fourier'], default='raw',
+                        help='温度参数化方式：raw=逐工况独立；fourier=傅里叶降维')
+    parser.add_argument('--fourier-harmonics', type=int, default=3,
+                        help='傅里叶基的最高谐波次数 (>=0)')
+    parser.add_argument('--fourier-period', type=float,
+                        help='傅里叶基的基周期（默认等于样本数，对应完整循环）')
+    parser.add_argument('--fourier-time-column', type=str,
+                        help='用于傅里叶基的时间列名（默认为样本索引）')
+    parser.add_argument('--no-fourier-bias', action='store_true',
+                        help='傅里叶基中移除常数项 (默认包含)')
+    parser.add_argument('--fourier-coeff-lower', type=float,
+                        help='傅里叶系数统一下界（默认沿用温度梯度下界）')
+    parser.add_argument('--fourier-coeff-upper', type=float,
+                        help='傅里叶系数统一上界（默认沿用温度梯度上界）')
     
     parser.add_argument('--use-displacements', action='store_true',
                         help='使用支座位移测量值 (v_A, v_B, v_C, v_D)')
@@ -102,6 +117,28 @@ def main():
         print(f"\n使用固定KV参数: {fixed_kv_factors}")
     
     fix_first_settlement = not args.no_fix_first_settlement
+
+    temperature_basis = None
+    if args.temp_basis == 'fourier':
+        if args.fourier_time_column:
+            if args.fourier_time_column not in df.columns:
+                raise SystemExit(f"数据中不存在时间列: {args.fourier_time_column}")
+            time_values = df[args.fourier_time_column].to_numpy(dtype=float)
+        else:
+            time_values = np.arange(len(df), dtype=float)
+        fundamental_period = args.fourier_period if args.fourier_period is not None else float(len(df))
+        temperature_basis = FourierTemperatureBasis(
+            n_cases=reactions_matrix.shape[0],
+            temp_segments=actual_segments,
+            harmonics=max(0, args.fourier_harmonics),
+            include_bias=not args.no_fourier_bias,
+            time_values=time_values,
+            fundamental_period=fundamental_period,
+            coeff_lower=args.fourier_coeff_lower,
+            coeff_upper=args.fourier_coeff_upper,
+        )
+        print(f"\n使用傅里叶温度基: 谐波={args.fourier_harmonics}, 周期={fundamental_period}, "
+              f"时间列={'索引' if not args.fourier_time_column else args.fourier_time_column}")
     
     fitter = VectorizedMultiCaseFitter(
         reactions_matrix=reactions_matrix,
@@ -115,6 +152,7 @@ def main():
         displacements_matrix=displacements_matrix,
         rotations_matrix=rotations_matrix,
         span_rotations_matrix=span_rotations_matrix,
+        temperature_basis=temperature_basis,
     )
     
     result = fitter.fit(

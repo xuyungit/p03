@@ -16,6 +16,7 @@ from models.bridge_forward_model import (
 )
 
 from .config import MeasurementConfig, OptimizationConfig
+from .temperature_models import RawTemperatureBasis, TemperatureBasis
 
 
 def batch_thermal_load_vectors(
@@ -99,6 +100,7 @@ class VectorizedMultiCaseFitter:
         rotations_matrix: Optional[np.ndarray] = None,
         span_rotations_matrix: Optional[np.ndarray] = None,
         opt_config: Optional[OptimizationConfig] = None,
+        temperature_basis: Optional[TemperatureBasis] = None,
     ):
         self.reactions_matrix = reactions_matrix
         self.n_cases = reactions_matrix.shape[0]
@@ -113,6 +115,11 @@ class VectorizedMultiCaseFitter:
         self.temp_segments = temp_segments
         
         self.opt_config = opt_config if opt_config is not None else OptimizationConfig()
+        self.temperature_basis = temperature_basis or RawTemperatureBasis(self.n_cases, self.temp_segments)
+        if self.temperature_basis.n_cases != self.n_cases:
+            raise ValueError("temperature_basis.n_cases must equal number of cases")
+        if self.temperature_basis.temp_segments != self.temp_segments:
+            raise ValueError("temperature_basis.temp_segments must match temp_segments")
         
         if measurement_config is None:
             measurement_config = MeasurementConfig(use_reactions=True)
@@ -180,6 +187,7 @@ class VectorizedMultiCaseFitter:
         print(f"  KV参数: {kv_status}")
         print(f"  沉降参数: {settlement_status}")
         print(f"  优化特性: 批量求解 + 向量化温度载荷 (nT={self.temp_segments})")
+        print(f"  温度参数化: {self.temperature_basis.describe()}")
         
         if measurement_config.auto_normalize:
             print(f"\n归一化标度 (基于测量数据的标准差):")
@@ -218,11 +226,11 @@ class VectorizedMultiCaseFitter:
                 lower_list.extend([self.opt_config.kv_factor_lower] * 4)
                 upper_list.extend([self.opt_config.kv_factor_upper] * 4)
         
-        nT = self.temp_segments
-        for _ in range(self.n_cases):
-            x0_list.extend([self.opt_config.temp_gradient_initial] * nT)
-            lower_list.extend([self.opt_config.temp_gradient_lower] * nT)
-            upper_list.extend([self.opt_config.temp_gradient_upper] * nT)
+        temp_init = self.temperature_basis.initial(self.opt_config)
+        temp_lower, temp_upper = self.temperature_basis.bounds(self.opt_config)
+        x0_list.extend(temp_init.tolist())
+        lower_list.extend(temp_lower.tolist())
+        upper_list.extend(temp_upper.tolist())
         
         x0 = np.array(x0_list)
         lower = np.array(lower_list)
@@ -232,11 +240,11 @@ class VectorizedMultiCaseFitter:
         n_ei = 3 if fit_struct else 0
         n_kv = 0 if (not fit_struct or self.fixed_kv_factors is not None) else 4
         n_struct = n_settlement + n_ei + n_kv
-        n_temp = self.n_cases * self.temp_segments
+        n_temp = self.temperature_basis.num_params()
         
         print(f"\n参数空间:")
         print(f"  结构参数: {n_struct} (沉降: {n_settlement}, EI: {n_ei}, KV: {n_kv})")
-        print(f"  温度参数: {n_temp} ({self.n_cases} × {self.temp_segments})")
+        print(f"  温度参数: {n_temp} ({self.temperature_basis.describe()})")
         print(f"  总参数数: {len(x0)}")
         
         return x0, (lower, upper)
@@ -278,7 +286,7 @@ class VectorizedMultiCaseFitter:
             ne_per_span=self.ne_per_span,
         )
         
-        dT_matrix = x[idx:].reshape(self.n_cases, self.temp_segments)
+        dT_matrix = self.temperature_basis.expand(x[idx:])
         
         return struct_params, dT_matrix
     
@@ -411,6 +419,8 @@ class VectorizedMultiCaseFitter:
         )
         
         struct_params, dT_matrix = self._unpack_params(result.x, fit_struct)
+        temp_param_count = self.temperature_basis.num_params()
+        temperature_params = result.x[-temp_param_count:].copy()
         thermal_states = [ThermalState(dT_spans=tuple(row)) for row in dT_matrix]  # type: ignore[arg-type]
         
         _, reactions_all, displacements_all, rotations_all, span_rotations_all = batch_solve_with_system(
@@ -445,6 +455,7 @@ class VectorizedMultiCaseFitter:
             'optimality': result.optimality,
             'nfev': result.nfev,
             'x': result.x,
+            'temperature_params': temperature_params,
             'n_residual_calls': self._n_residual_calls,
             'n_system_assemblies': self._n_system_assemblies,
         }

@@ -54,8 +54,30 @@ uv run python src/models/fit_multi_case_v2.py \
     --maxiter 500 \                   # 最大迭代次数
     --temp-spatial-weight 1.0 \       # 空间平滑权重
     --temp-temporal-weight 1.0 \      # 时序平滑权重
+    --temp-basis fourier \            # (可选) 使用傅里叶降维
+    --fourier-harmonics 3 \           # (可选) 谐波次数，默认3
     --output results/output.csv       # 输出文件
 ```
+
+### 温度降维（傅里叶基）
+
+从 `bridge_fitting` CLI 版本开始，温度梯度支持傅里叶级数降维：
+
+```bash
+uv run python src/models/bridge_fitting/cli.py \
+    --data data/day1.csv \
+    --temp-basis fourier \
+    --fourier-harmonics 3 \
+    --fourier-period 1440 \
+    --fourier-time-column minute_of_day
+```
+
+- `--temp-basis fourier` 启用傅里叶参数化（默认沿用逐工况温度）
+- `--fourier-harmonics` 控制最高谐波次数（`k=3` 时每条温度曲线仅需 7 个系数）
+- `--fourier-period` 指定完整周期（默认等于样本数，适用于日循环）
+- `--fourier-time-column` 可选，用于提供实际时间戳列；未指定时使用样本顺序
+
+该方法将原本 1440 × 3 个温度变量压缩为 3 × (2k+1) 个系数，大幅降低优化维度，同时自然保证时间上的平滑性。
 
 ## 工作原理
 
