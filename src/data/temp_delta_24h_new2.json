@@ -1,0 +1,132 @@
+{
+    "n_samples": 1440,
+    "seed": 789,
+    "constraint_passes": 30,
+    "parameters": {
+        "settlement_b_mm": {
+            "mode": "fixed",
+            "value": 6.762363178489720,
+            "dtype": "float"
+        },
+        "settlement_c_mm": {
+            "mode": "fixed",
+            "value": 5.367421144015630,
+            "dtype": "float"
+        },
+        "settlement_d_mm": {
+            "mode": "fixed",
+            "value": 3.916970150376210,
+            "dtype": "float"
+        },
+        "kv_factor_a": {
+            "mode": "fixed",
+            "value": 1.2187563321703900,
+            "dtype": "float"
+        },
+        "kv_factor_b": {
+            "mode": "fixed",
+            "value": 0.5751489461951170,
+            "dtype": "float"
+        },
+        "kv_factor_c": {
+            "mode": "fixed",
+            "value": 1.031337895062410,
+            "dtype": "float"
+        },
+        "kv_factor_d": {
+            "mode": "fixed",
+            "value": 0.9522946684807020,
+            "dtype": "float"
+        },
+        "ei_factor_s1": {
+            "mode": "fixed",
+            "value": 0.9041935298079320,
+            "dtype": "float"
+        },
+        "ei_factor_s2": {
+            "mode": "fixed",
+            "value": 1.3229163792255000,
+            "dtype": "float"
+        },
+        "ei_factor_s3": {
+            "mode": "fixed",
+            "value": 0.9368234415804840,
+            "dtype": "float"
+        },
+        "dT_s1_C": {
+            "mode": "custom",
+            "function": "diurnal_temperature_delta",
+            "params": {
+                "amplitude": 16,
+                "base": 6.0,
+                "phase_shift_hours": 14,
+                "noise_std": 0.5
+            },
+            "round": 2
+        },
+        "dT_s2_C": {
+            "mode": "relative",
+            "base": "dT_s1_C",
+            "delta_mode": "uniform",
+            "max_delta": 5.0,
+            "min_total": -10.0,
+            "max_total": 20.0,
+            "round": 2
+        },
+        "dT_s3_C": {
+            "mode": "relative",
+            "base": "dT_s2_C",
+            "delta_mode": "normal",
+            "delta_std": 1.2,
+            "max_delta": 5.0,
+            "min_total": -10.0,
+            "max_total": 20.0,
+            "round": 2,
+            "clip": false
+        }
+    },
+    "constraints": [
+        {
+            "type": "temporal_smooth",
+            "columns": [
+                "dT_s1_C",
+                "dT_s2_C",
+                "dT_s3_C"
+            ],
+            "method": "moving_average",
+            "window": 3,
+            "passes": 1
+        },
+        {
+            "type": "adjacent_delta_limit",
+            "columns": [
+                "dT_s1_C",
+                "dT_s2_C",
+                "dT_s3_C"
+            ],
+            "max_delta": 5.0,
+            "clip": true
+        },
+        {
+            "type": "column_range_limit",
+            "columns": [
+                "dT_s1_C",
+                "dT_s2_C",
+                "dT_s3_C"
+            ],
+            "min": -10.0,
+            "max": 20.0,
+            "clip": true
+        },
+        {
+            "type": "temporal_delta_limit",
+            "columns": [
+                "dT_s1_C",
+                "dT_s2_C",
+                "dT_s3_C"
+            ],
+            "max_delta": 3.0,
+            "clip": true
+        }
+    ]
+}

@@ -1,0 +1,71 @@
+{
+  "n_samples": 1440,
+  "seed": 789,
+  "constraint_passes": 30,
+  "parameters": {
+    "settlement_b_mm": { "mode": "fixed", "value": 6.76236317848972, "dtype": "float" },
+    "settlement_c_mm": { "mode": "fixed", "value": 5.36742114401563, "dtype": "float" },
+    "settlement_d_mm": { "mode": "fixed", "value": 3.91697015037621, "dtype": "float" },
+
+    "kv_factor_a": { "mode": "fixed", "value": 1.21875633217039, "dtype": "float" },
+    "kv_factor_b": { "mode": "fixed", "value": 0.575148946195117, "dtype": "float" },
+    "kv_factor_c": { "mode": "fixed", "value": 1.03133789506241, "dtype": "float" },
+    "kv_factor_d": { "mode": "fixed", "value": 0.952294668480702, "dtype": "float" },
+
+    "ei_factor_s1": { "mode": "fixed", "value": 0.904193529807932, "dtype": "float" },
+    "ei_factor_s2": { "mode": "fixed", "value": 1.3229163792255, "dtype": "float" },
+    "ei_factor_s3": { "mode": "fixed", "value": 0.936823441580484, "dtype": "float" },
+
+    "dT_left_C": {
+      "mode": "custom",
+      "function": "diurnal_temperature_delta",
+      "params": {
+        "amplitude": 16,
+        "base": 6.0,
+        "phase_shift_hours": 14,
+        "noise_std": 0.5
+      },
+      "round": 2
+    },
+    "dT_right_C": {
+      "mode": "relative",
+      "base": "dT_left_C",
+      "delta_mode": "normal",
+      "delta_std": 1.2,
+      "max_delta": 5.0,
+      "min_total": -10.0,
+      "max_total": 20.0,
+      "round": 2,
+      "clip": false
+    }
+  },
+  "constraints": [
+    {
+      "type": "temporal_smooth",
+      "columns": ["dT_left_C", "dT_right_C"],
+      "method": "moving_average",
+      "window": 3,
+      "passes": 1
+    },
+    {
+      "type": "adjacent_delta_limit",
+      "columns": ["dT_left_C", "dT_right_C"],
+      "max_delta": 5.0,
+      "clip": true
+    },
+    {
+      "type": "column_range_limit",
+      "columns": ["dT_left_C", "dT_right_C"],
+      "min": -10.0,
+      "max": 20.0,
+      "clip": true
+    },
+    {
+      "type": "temporal_delta_limit",
+      "columns": ["dT_left_C", "dT_right_C"],
+      "max_delta": 3.0,
+      "clip": true
+    }
+  ]
+}
+
