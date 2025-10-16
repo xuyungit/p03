@@ -340,25 +340,39 @@ class VectorizedMultiCaseFitter:
         
         physics_residuals = np.concatenate(residuals_list)
 
+        def _huber_residual(diff: np.ndarray, scale: float, delta: float) -> np.ndarray:
+            """Huber-style residual for smooth thresholding."""
+            if delta <= 0.0:
+                return scale * diff
+            abs_diff = np.abs(diff)
+            mask = abs_diff <= delta
+            res = np.empty_like(diff)
+            if np.any(mask):
+                res[mask] = scale * diff[mask]
+            if np.any(~mask):
+                sqrt_term = np.sqrt(2.0 * delta * (abs_diff[~mask] - 0.5 * delta))
+                res[~mask] = scale * np.sign(diff[~mask]) * sqrt_term
+            return res
+
         if self.temp_spatial_weight > 0:
+            spatial_scale = np.sqrt(self.temp_spatial_weight)
+            delta_spatial = self.opt_config.temp_spatial_diff_thresh
             if self.temp_segments == 3:
                 diff_01 = dT_matrix[:, 1] - dT_matrix[:, 0]
                 diff_12 = dT_matrix[:, 2] - dT_matrix[:, 1]
-                spatial_penalty_01 = np.maximum(0.0, np.abs(diff_01) - self.opt_config.temp_spatial_diff_thresh) * self.temp_spatial_weight
-                spatial_penalty_12 = np.maximum(0.0, np.abs(diff_12) - self.opt_config.temp_spatial_diff_thresh) * self.temp_spatial_weight
-                self._spatial_residuals[0::2] = spatial_penalty_01
-                self._spatial_residuals[1::2] = spatial_penalty_12
+                self._spatial_residuals[0::2] = _huber_residual(diff_01, spatial_scale, delta_spatial)
+                self._spatial_residuals[1::2] = _huber_residual(diff_12, spatial_scale, delta_spatial)
             else:
                 diff = dT_matrix[:, 1] - dT_matrix[:, 0]
-                spatial_penalty = np.maximum(0.0, np.abs(diff) - self.opt_config.temp_spatial_diff_thresh) * self.temp_spatial_weight
-                self._spatial_residuals[:] = spatial_penalty
+                self._spatial_residuals[:] = _huber_residual(diff, spatial_scale, delta_spatial)
         else:
             self._spatial_residuals[:] = 0.0
 
         if self.temp_temporal_weight > 0:
+            temporal_scale = np.sqrt(self.temp_temporal_weight)
+            delta_temporal = self.opt_config.temp_temporal_diff_thresh
             dT_diff = dT_matrix[1:, :] - dT_matrix[:-1, :]
-            temporal_penalty = np.maximum(0.0, np.abs(dT_diff) - self.opt_config.temp_temporal_diff_thresh) * self.temp_temporal_weight
-            self._temporal_residuals[:] = temporal_penalty.ravel()
+            self._temporal_residuals[:] = _huber_residual(dT_diff, temporal_scale, delta_temporal).ravel()
         else:
             self._temporal_residuals[:] = 0.0
         
