@@ -114,6 +114,26 @@ def main():
         help="Add Gaussian noise proportional to each value. The value provided is the standard deviation of the noise relative to the value (e.g., 0.05 for 5%%)."
     )
     parser.add_argument(
+        "--apply-angle-sensor-noise",
+        action="store_true",
+        help=(
+            "Apply a Gaussian sensor noise model (σ=0.005° by default) and quantize to a 0.001° step. "
+            "Intended for angle channels already expressed in radians."
+        ),
+    )
+    parser.add_argument(
+        "--sensor-sigma-deg",
+        type=float,
+        default=0.005,
+        help="Override the sensor noise standard deviation in degrees. Only used with --apply-angle-sensor-noise.",
+    )
+    parser.add_argument(
+        "--sensor-resolution-deg",
+        type=float,
+        default=0.001,
+        help="Override the sensor quantization resolution in degrees. Only used with --apply-angle-sensor-noise.",
+    )
+    parser.add_argument(
         "--add-bias-range",
         type=float,
         nargs=2,
@@ -156,6 +176,16 @@ def main():
     )
 
     args = parser.parse_args()
+
+    sensor_sigma_rad = None
+    sensor_resolution_rad = None
+    if args.apply_angle_sensor_noise:
+        if args.sensor_sigma_deg < 0:
+            raise ValueError("--sensor-sigma-deg must be non-negative when applying angle sensor noise.")
+        if args.sensor_resolution_deg <= 0:
+            raise ValueError("--sensor-resolution-deg must be positive when applying angle sensor noise.")
+        sensor_sigma_rad = float(np.deg2rad(args.sensor_sigma_deg))
+        sensor_resolution_rad = float(np.deg2rad(args.sensor_resolution_deg))
 
     # --- Setup ---
     if args.noise_seed is not None:
@@ -235,6 +265,24 @@ def main():
             if bias_records:
                 modified = True
 
+        if args.apply_angle_sensor_noise:
+            print(
+                "Applying angle sensor noise with σ="
+                f"{args.sensor_sigma_deg:.6f}° and resolution={args.sensor_resolution_deg:.6f}° "
+                "(text-preserving mode)"
+            )
+            for col in columns_to_perturb:
+                base = pd.to_numeric(raw_df[col], errors='coerce')
+                noisy_vals = base + np.random.normal(0.0, sensor_sigma_rad, size=base.shape)
+                quantized_vals = np.round(noisy_vals / sensor_resolution_rad) * sensor_resolution_rad
+                formatted = [
+                    raw if np.isnan(v) else _format_float(float(v), args.round_digits, args.float_format)
+                    for raw, v in zip(raw_df[col].tolist(), quantized_vals.tolist())
+                ]
+                raw_df[col] = formatted
+            modified = True
+            print("Angle sensor noise applied.")
+
         # Save using same encoding signature as input (preserve BOM if present)
         args.output_csv.parent.mkdir(parents=True, exist_ok=True)
         write_encoding = "utf-8-sig" if has_bom else None
@@ -277,6 +325,18 @@ def main():
                 print("No columns matched for bias application; no bias CSV created.")
             if bias_records:
                 modified = True
+
+        if args.apply_angle_sensor_noise:
+            print(
+                "Applying angle sensor noise with σ="
+                f"{args.sensor_sigma_deg:.6f}° and resolution={args.sensor_resolution_deg:.6f}°"
+            )
+            for col in columns_to_perturb:
+                noise = np.random.normal(0.0, sensor_sigma_rad, size=df[col].shape)
+                noisy_vals = df[col] + noise
+                df[col] = np.round(noisy_vals / sensor_resolution_rad) * sensor_resolution_rad
+            modified = True
+            print("Angle sensor noise applied.")
 
         if not modified:
             print("No perturbation options were specified. Output file will be a copy of the input.")
