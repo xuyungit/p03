@@ -30,6 +30,15 @@ Usage (Channel Bias):
     --add-bias-range -0.5 0.5 \
     --bias-output-csv /path/to/bias.csv
 
+Usage (Channel Bias with New Columns):
+  uv run python add_data_perturbation.py \
+    --input-csv /path/to/your/data.csv \
+    --output-csv /path/to/your/data_biased.csv \
+    --columns-re "^channel_\\d+$" \
+    --add-bias-range -0.5 0.5 \
+    --bias-add-new-columns \
+    --bias-output-csv /path/to/bias.csv
+
 Notes:
 - By default, non-target columns are preserved byte-for-byte where possible
   (textual pass-through). This avoids unintended diffs on unrelated columns
@@ -146,6 +155,14 @@ def main():
         help="Optional path to write the per-column bias values when --add-bias-range is used. Defaults to bias.csv next to the output CSV.",
     )
     parser.add_argument(
+        "--bias-add-new-columns",
+        action="store_true",
+        help=(
+            "When adding bias, create new columns (column_name_bias and column_name_with_bias) "
+            "instead of modifying the original columns. Original columns are preserved unchanged."
+        ),
+    )
+    parser.add_argument(
         "--noise-seed",
         type=int,
         help="Optional random seed for noise generation to ensure reproducibility."
@@ -247,13 +264,34 @@ def main():
 
             print(f"Applying per-column bias sampled uniformly from [{bias_min}, {bias_max}] (text-preserving mode)")
             bias_records = []
-            for col in columns_to_perturb:
-                bias_value = float(np.random.uniform(bias_min, bias_max))
-                base = pd.to_numeric(raw_df[col], errors='coerce')
-                new_vals = base + bias_value
-                formatted = [raw if np.isnan(v) else _format_float(float(v), args.round_digits, args.float_format) for raw, v in zip(raw_df[col].tolist(), new_vals.tolist())]
-                raw_df[col] = formatted
-                bias_records.append({"column": col, "bias": bias_value})
+            
+            if args.bias_add_new_columns:
+                # 创建新列而不是修改原列
+                print("Creating new columns with _bias and _with_bias suffixes...")
+                for col in columns_to_perturb:
+                    bias_value = float(np.random.uniform(bias_min, bias_max))
+                    base = pd.to_numeric(raw_df[col], errors='coerce')
+                    new_vals = base + bias_value
+                    
+                    # 添加 _bias 列 (常数列，所有行的值都是这个 bias_value)
+                    bias_col_name = f"{col}_bias"
+                    raw_df[bias_col_name] = _format_float(bias_value, args.round_digits, args.float_format)
+                    
+                    # 添加 _with_bias 列
+                    with_bias_col_name = f"{col}_with_bias"
+                    formatted = [raw if np.isnan(v) else _format_float(float(v), args.round_digits, args.float_format) for raw, v in zip(raw_df[col].tolist(), new_vals.tolist())]
+                    raw_df[with_bias_col_name] = formatted
+                    
+                    bias_records.append({"column": col, "bias": bias_value})
+            else:
+                # 原有逻辑：直接修改列
+                for col in columns_to_perturb:
+                    bias_value = float(np.random.uniform(bias_min, bias_max))
+                    base = pd.to_numeric(raw_df[col], errors='coerce')
+                    new_vals = base + bias_value
+                    formatted = [raw if np.isnan(v) else _format_float(float(v), args.round_digits, args.float_format) for raw, v in zip(raw_df[col].tolist(), new_vals.tolist())]
+                    raw_df[col] = formatted
+                    bias_records.append({"column": col, "bias": bias_value})
 
             if bias_records:
                 bias_output_path = args.bias_output_csv or args.output_csv.parent / "bias.csv"
@@ -311,10 +349,28 @@ def main():
 
             print(f"Applying per-column bias sampled uniformly from [{bias_min}, {bias_max}]")
             bias_records = []
-            for col in columns_to_perturb:
-                bias_value = np.random.uniform(bias_min, bias_max)
-                df[col] = df[col] + bias_value
-                bias_records.append({"column": col, "bias": bias_value})
+            
+            if args.bias_add_new_columns:
+                # 创建新列而不是修改原列
+                print("Creating new columns with _bias and _with_bias suffixes...")
+                for col in columns_to_perturb:
+                    bias_value = np.random.uniform(bias_min, bias_max)
+                    
+                    # 添加 _bias 列 (常数列，所有行的值都是这个 bias_value)
+                    bias_col_name = f"{col}_bias"
+                    df[bias_col_name] = bias_value
+                    
+                    # 添加 _with_bias 列
+                    with_bias_col_name = f"{col}_with_bias"
+                    df[with_bias_col_name] = df[col] + bias_value
+                    
+                    bias_records.append({"column": col, "bias": bias_value})
+            else:
+                # 原有逻辑：直接修改列
+                for col in columns_to_perturb:
+                    bias_value = np.random.uniform(bias_min, bias_max)
+                    df[col] = df[col] + bias_value
+                    bias_records.append({"column": col, "bias": bias_value})
 
             if bias_records:
                 bias_output_path = args.bias_output_csv or args.output_csv.parent / "bias.csv"
