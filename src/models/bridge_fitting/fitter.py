@@ -448,17 +448,25 @@ class VectorizedMultiCaseFitter:
         fit_struct: bool = True,
         maxiter: int = 200,
         verbose: int = 2,
+        x0_override: np.ndarray | None = None,
     ) -> dict:
         """Perform joint fitting."""
         print(f"\n{'='*60}")
         print("开始优化 (向量化版本 v2)...")
         print(f"{'='*60}")
-        
+
         self._n_residual_calls = 0
         self._n_system_assemblies = 0
-        
+
         x0, bounds = self._build_x0_and_bounds(fit_struct)
-        
+
+        if x0_override is not None:
+            if x0_override.shape != x0.shape:
+                raise ValueError(
+                    f"x0_override shape {x0_override.shape} does not match expected {x0.shape}"
+                )
+            x0 = x0_override.astype(float, copy=True)
+
         result = least_squares(
             self._residual,
             x0,

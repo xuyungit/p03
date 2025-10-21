@@ -83,7 +83,7 @@ def print_fitting_results(
     if rotation_biases is not None and len(rotation_bias_labels) == len(rotation_biases):
         print(f"\n拟合的转角偏差 (rad):")
         for label, bias in zip(rotation_bias_labels, rotation_biases):
-            print(f"  {label}: {bias:+.6e}")
+            print(f"  {label}: {bias:+.8f}")
     
     true_settlements, true_ei, true_kv = extract_true_parameters(const_params)
     fitted_settlements = np.array(sp.settlements)

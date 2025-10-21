@@ -52,7 +52,7 @@ uv run python src/models/bridge_2d_fit.py \
     --maxiter 100 \
     --output results/r_n5_6_theta_round4_fit_kv.csv \
     --temp-basis fourier --fourier-harmonics 8 \
-    --fit-rotation-bias
+    --fit-rotation-bias --refit-after-bias --stage1-rotation-weight 20.0
 
 uv run python src/models/bridge_2d_fit.py \
     --data data/augmented/dt_24hours_data_new_rsensor0501_noise5.csv \
@@ -73,13 +73,15 @@ uv run python src/models/bridge_2d_fit.py \
     --temp-basis fourier --fourier-harmonics 8
 
 uv run python src/models/bridge_2d_fit.py \
-    --data data/augmented/dt_24hours_data_new_rsensor0501_noise5.csv \
+    --data data/augmented/dt_24hours_data_new_rsensor0501_noise5_biased.csv \
     --fixed-kv 1.21875633217039 0.575148946195117 1.03133789506241 0.952294668480702 \
     --use-rotations --rotation-weight 1.0 \
     --use-span-rotations --span-rotation-weight 1.0 \
     --maxiter 100 \
     --output results/r_n5_6_theta_round4_fit_kv.csv \
     --temp-basis fourier --fourier-harmonics 8
+    --fit-rotation-bias --refit-after-bias --stage1-rotation-weight 20.0
+    
 
 
 # 反力

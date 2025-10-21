@@ -57,12 +57,16 @@ def main():
                         help='位移残差权重 (相对于反力，默认1.0)')
     parser.add_argument('--rotation-weight', type=float, default=1.0,
                         help='转角残差权重 (相对于反力，默认1.0)')
+    parser.add_argument('--stage1-rotation-weight', type=float,
+                        help='在拟合转角偏差的阶段使用的转角残差权重（若未指定，则等于 --rotation-weight）')
     parser.add_argument('--span-rotation-weight', type=float, default=1.0,
                         help='跨中转角残差权重 (相对于反力，默认1.0)')
     parser.add_argument('--no-auto-normalize', action='store_true',
                         help='禁用自动归一化（默认启用，基于测量数据标准差归一化）')
     parser.add_argument('--fit-rotation-bias', action='store_true',
                         help='同时拟合转角列的全局偏差（每列一个偏差）')
+    parser.add_argument('--refit-after-bias', action='store_true',
+                        help='先拟合转角偏差，再固定偏差并在校正后的转角数据上重新拟合结构/温度参数')
     
     args = parser.parse_args()
     
@@ -70,19 +74,23 @@ def main():
     print("数据加载")
     print(f"{'='*60}")
     
-    measurement_config = MeasurementConfig(
+    stage1_rotation_weight = (
+        args.stage1_rotation_weight if args.stage1_rotation_weight is not None else args.rotation_weight
+    )
+
+    measurement_config_stage1 = MeasurementConfig(
         use_reactions=True,
         use_displacements=args.use_displacements,
         use_rotations=args.use_rotations,
         use_span_rotations=args.use_span_rotations,
         displacement_weight=args.displacement_weight,
-        rotation_weight=args.rotation_weight,
+        rotation_weight=stage1_rotation_weight,
         span_rotation_weight=args.span_rotation_weight,
         auto_normalize=not args.no_auto_normalize,
     )
-    
+
     df, const_params, detected_config = load_multi_case_data(
-        args.data, args.max_samples, measurement_config
+        args.data, args.max_samples, measurement_config_stage1
     )
     
     try:
@@ -96,9 +104,9 @@ def main():
             span_rotation_column_labels,
         ) = setup_measurement_matrices(
             df,
-            measurement_config,
-            use_rotation_bias_columns=args.fit_rotation_bias,
-        )
+        measurement_config_stage1,
+        use_rotation_bias_columns=args.fit_rotation_bias,
+    )
     except KeyError as exc:
         raise SystemExit(str(exc)) from exc
     
@@ -155,6 +163,8 @@ def main():
         print(f"\n使用傅里叶温度基: 谐波={args.fourier_harmonics}, 周期={fundamental_period}, "
               f"时间列={'索引' if not args.fourier_time_column else args.fourier_time_column}")
     
+    measurement_config_stage1 = measurement_config  # use possibly updated flags from setup
+
     fitter = VectorizedMultiCaseFitter(
         reactions_matrix=reactions_matrix,
         uniform_load=uniform_load,
@@ -163,7 +173,7 @@ def main():
         fixed_kv_factors=fixed_kv_factors,
         fix_first_settlement=fix_first_settlement,
         temp_segments=actual_segments,
-        measurement_config=measurement_config,
+        measurement_config=measurement_config_stage1,
         displacements_matrix=displacements_matrix,
         rotations_matrix=rotations_matrix,
         span_rotations_matrix=span_rotations_matrix,
@@ -173,14 +183,14 @@ def main():
         span_rotation_column_labels=span_rotation_column_labels,
     )
     
-    result = fitter.fit(
+    result_first_stage = fitter.fit(
         fit_struct=not args.no_fit_struct,
         maxiter=args.maxiter,
         verbose=2,
     )
-    
+
     recomputed_reactions, recomputed_displacements, recomputed_rotations, recomputed_span_rotations, reaction_forward_res = print_fitting_results(
-        result=result,
+        result=result_first_stage,
         const_params=const_params,
         true_temps=true_temps,
         reactions_matrix=reactions_matrix,
@@ -190,19 +200,139 @@ def main():
         fitter=fitter,
     )
 
-    rotation_biases = result.get('rotation_biases')
-    rotation_bias_support = None
-    rotation_bias_span = None
-    if rotation_biases is not None:
+    rotation_biases_stage1 = result_first_stage.get('rotation_biases')
+    rotation_bias_support_stage1 = None
+    rotation_bias_span_stage1 = None
+    if rotation_biases_stage1 is not None:
         if fitter._rotation_bias_support_count:
-            rotation_bias_support = rotation_biases[:fitter._rotation_bias_support_count]
+            rotation_bias_support_stage1 = rotation_biases_stage1[:fitter._rotation_bias_support_count]
         if fitter._rotation_bias_span_count:
-            rotation_bias_span = rotation_biases[fitter._rotation_bias_support_count:]
-    
+            rotation_bias_span_stage1 = rotation_biases_stage1[fitter._rotation_bias_support_count:]
+
+    final_result = result_first_stage
+    final_recomputed_reactions = recomputed_reactions
+    final_recomputed_displacements = recomputed_displacements
+    final_recomputed_rotations = recomputed_rotations
+    final_recomputed_span_rotations = recomputed_span_rotations
+    final_reaction_forward_res = reaction_forward_res
+    final_rotations_matrix = rotations_matrix
+    final_span_rotations_matrix = span_rotations_matrix
+    rotation_bias_support_for_output = rotation_bias_support_stage1
+    rotation_bias_span_for_output = rotation_bias_span_stage1
+    final_measurement_config = measurement_config_stage1
+
+    if args.refit_after_bias:
+        if not args.fit_rotation_bias:
+            print('\n⚠️  --refit-after-bias 已指定，但未启用 --fit-rotation-bias，跳过二阶段拟合。')
+        elif rotation_biases_stage1 is None:
+            print('\n⚠️  一阶段未返回转角偏差，无法执行二阶段拟合。')
+        else:
+            print(f"\n{'='*60}")
+            print("二阶段拟合 - 固定偏差并使用校正后的转角数据")
+            print(f"{'='*60}")
+
+            rotations_corrected = None
+            if rotations_matrix is not None and rotation_bias_support_stage1 is not None:
+                rotations_corrected = rotations_matrix - rotation_bias_support_stage1[np.newaxis, :]
+            else:
+                rotations_corrected = rotations_matrix
+
+            span_rotations_corrected = None
+            if span_rotations_matrix is not None and rotation_bias_span_stage1 is not None:
+                span_rotations_corrected = span_rotations_matrix - rotation_bias_span_stage1[np.newaxis, :]
+            else:
+                span_rotations_corrected = span_rotations_matrix
+
+            measurement_config_stage2 = measurement_config_stage1
+            if measurement_config_stage1.use_rotations and args.stage1_rotation_weight is not None:
+                if abs(args.rotation_weight - stage1_rotation_weight) > 0:
+                    measurement_config_stage2 = MeasurementConfig(
+                        use_reactions=measurement_config_stage1.use_reactions,
+                        use_displacements=measurement_config_stage1.use_displacements,
+                        use_rotations=measurement_config_stage1.use_rotations,
+                        use_span_rotations=measurement_config_stage1.use_span_rotations,
+                        displacement_weight=measurement_config_stage1.displacement_weight,
+                        rotation_weight=args.rotation_weight,
+                        span_rotation_weight=measurement_config_stage1.span_rotation_weight,
+                        auto_normalize=measurement_config_stage1.auto_normalize,
+                    )
+                    print(f"\n二阶段使用的转角权重: {args.rotation_weight}")
+
+            refit_fitter = VectorizedMultiCaseFitter(
+                reactions_matrix=reactions_matrix,
+                uniform_load=uniform_load,
+                temp_spatial_weight=args.temp_spatial_weight,
+                temp_temporal_weight=args.temp_temporal_weight,
+                fixed_kv_factors=fixed_kv_factors,
+                fix_first_settlement=fix_first_settlement,
+                temp_segments=actual_segments,
+                measurement_config=measurement_config_stage2,
+                displacements_matrix=displacements_matrix,
+                rotations_matrix=rotations_corrected,
+                span_rotations_matrix=span_rotations_corrected,
+                temperature_basis=temperature_basis,
+                fit_rotation_bias=False,
+                rotation_column_labels=rotation_column_labels,
+                span_rotation_column_labels=span_rotation_column_labels,
+            )
+
+            warm_start_vector = None
+            fit_struct_flag = not args.no_fit_struct
+            warm_values: list[float] = []
+            sp_stage1 = result_first_stage['struct_params']
+
+            if fit_struct_flag:
+                if fix_first_settlement:
+                    warm_values.extend(sp_stage1.settlements[1:])
+                else:
+                    warm_values.extend(sp_stage1.settlements)
+                warm_values.extend(sp_stage1.ei_factors)
+                if fixed_kv_factors is None:
+                    warm_values.extend(sp_stage1.kv_factors)
+
+            temperature_params_stage1 = result_first_stage.get('temperature_params')
+            if temperature_params_stage1 is not None:
+                warm_values.extend(np.asarray(temperature_params_stage1, dtype=float).tolist())
+
+            expected_len = refit_fitter.temperature_basis.num_params()
+            if fit_struct_flag:
+                expected_len += 3 if fix_first_settlement else 4
+                expected_len += 3
+                if fixed_kv_factors is None:
+                    expected_len += 4
+
+            if len(warm_values) == expected_len:
+                warm_start_vector = np.asarray(warm_values, dtype=float)
+            else:
+                print('\n⚠️  无法使用一阶段结果作为初值：参数长度不匹配，将使用默认初值。')
+
+            result_second_stage = refit_fitter.fit(
+                fit_struct=not args.no_fit_struct,
+                maxiter=args.maxiter,
+                verbose=2,
+                x0_override=warm_start_vector,
+            )
+
+            final_recomputed_reactions, final_recomputed_displacements, final_recomputed_rotations, final_recomputed_span_rotations, final_reaction_forward_res = print_fitting_results(
+                result=result_second_stage,
+                const_params=const_params,
+                true_temps=true_temps,
+                reactions_matrix=reactions_matrix,
+                displacements_matrix=displacements_matrix,
+                rotations_matrix=rotations_corrected,
+                span_rotations_matrix=span_rotations_corrected,
+                fitter=refit_fitter,
+            )
+
+            final_result = result_second_stage
+            final_rotations_matrix = rotations_corrected
+            final_span_rotations_matrix = span_rotations_corrected
+            final_measurement_config = measurement_config_stage2
+
     if args.output:
         output_df = df.copy()
-        
-        sp = result['struct_params']
+
+        sp = final_result['struct_params']
         output_df['settlement_a_fitted'] = sp.settlements[0]
         output_df['settlement_b_fitted'] = sp.settlements[1]
         output_df['settlement_c_fitted'] = sp.settlements[2]
@@ -214,8 +344,8 @@ def main():
         output_df['kv_factor_b_fitted'] = sp.kv_factors[1]
         output_df['kv_factor_c_fitted'] = sp.kv_factors[2]
         output_df['kv_factor_d_fitted'] = sp.kv_factors[3]
-        
-        for i, ts in enumerate(result['thermal_states']):
+
+        for i, ts in enumerate(final_result['thermal_states']):
             if len(ts.dT_spans) == 3:
                 output_df.loc[i, 'dT_s1_fitted'] = ts.dT_spans[0]
                 output_df.loc[i, 'dT_s2_fitted'] = ts.dT_spans[1]
@@ -223,64 +353,64 @@ def main():
             else:
                 output_df.loc[i, 'dT_left_fitted'] = ts.dT_spans[0]
                 output_df.loc[i, 'dT_right_fitted'] = ts.dT_spans[1]
-        
+
         support_names = ['a', 'b', 'c', 'd']
         for i, name in enumerate(support_names):
-            output_df[f'R_{name}_recomputed_kN'] = recomputed_reactions[:, i]
-            output_df[f'v_{name.upper()}_recomputed_mm'] = recomputed_displacements[:, i]
-            output_df[f'theta_{name.upper()}_recomputed_rad'] = recomputed_rotations[:, i]
-            if rotation_bias_support is not None and i < len(rotation_bias_support):
-                output_df[f'theta_{name.upper()}_bias_rad'] = rotation_bias_support[i]
-                output_df[f'theta_{name.upper()}_corrected_rad'] = recomputed_rotations[:, i] + rotation_bias_support[i]
-        
+            output_df[f'R_{name}_recomputed_kN'] = final_recomputed_reactions[:, i]
+            output_df[f'v_{name.upper()}_recomputed_mm'] = final_recomputed_displacements[:, i]
+            output_df[f'theta_{name.upper()}_recomputed_rad'] = final_recomputed_rotations[:, i]
+            if rotation_bias_support_for_output is not None and i < len(rotation_bias_support_for_output):
+                output_df[f'theta_{name.upper()}_bias_rad'] = rotation_bias_support_for_output[i]
+                output_df[f'theta_{name.upper()}_corrected_rad'] = final_recomputed_rotations[:, i] + rotation_bias_support_for_output[i]
+
         span_names = ['S1-5_6L', 'S2-4_6L', 'S3-5_6L']
         for i, name in enumerate(span_names):
-            output_df[f'theta_{name}_recomputed_rad'] = recomputed_span_rotations[:, i]
-            if rotation_bias_span is not None and i < len(rotation_bias_span):
-                output_df[f'theta_{name}_bias_rad'] = rotation_bias_span[i]
-                output_df[f'theta_{name}_corrected_rad'] = recomputed_span_rotations[:, i] + rotation_bias_span[i]
-        
-        add_residual_columns(output_df, result['reaction_residuals'], 'residual_optimizer_R', 4)
-        add_residual_columns(output_df, result['displacement_residuals'], 'residual_optimizer_v', 4)
-        if rotation_bias_support is not None:
-            add_residual_columns(output_df, result['rotation_residuals'], 'residual_optimizer_theta', len(rotation_bias_support))
+            output_df[f'theta_{name}_recomputed_rad'] = final_recomputed_span_rotations[:, i]
+            if rotation_bias_span_for_output is not None and i < len(rotation_bias_span_for_output):
+                output_df[f'theta_{name}_bias_rad'] = rotation_bias_span_for_output[i]
+                output_df[f'theta_{name}_corrected_rad'] = final_recomputed_span_rotations[:, i] + rotation_bias_span_for_output[i]
+
+        add_residual_columns(output_df, final_result['reaction_residuals'], 'residual_optimizer_R', 4)
+        add_residual_columns(output_df, final_result['displacement_residuals'], 'residual_optimizer_v', 4)
+        if rotation_bias_support_for_output is not None:
+            add_residual_columns(output_df, final_result['rotation_residuals'], 'residual_optimizer_theta', len(rotation_bias_support_for_output))
         else:
-            add_residual_columns(output_df, result['rotation_residuals'], 'residual_optimizer_theta', 4)
-        if rotation_bias_span is not None:
-            add_residual_columns(output_df, result['span_rotation_residuals'], 'residual_optimizer_span_theta', len(rotation_bias_span))
+            add_residual_columns(output_df, final_result['rotation_residuals'], 'residual_optimizer_theta', 4)
+        if rotation_bias_span_for_output is not None:
+            add_residual_columns(output_df, final_result['span_rotation_residuals'], 'residual_optimizer_span_theta', len(rotation_bias_span_for_output))
         else:
-            add_residual_columns(output_df, result['span_rotation_residuals'], 'residual_optimizer_span_theta', 3)
-        
-        add_residual_columns(output_df, reaction_forward_res, 'residual_forward_R', 4)
-        
+            add_residual_columns(output_df, final_result['span_rotation_residuals'], 'residual_optimizer_span_theta', 3)
+
+        add_residual_columns(output_df, final_reaction_forward_res, 'residual_forward_R', 4)
+
         if displacements_matrix is not None:
-            disp_forward_res = recomputed_displacements - displacements_matrix
+            disp_forward_res = final_recomputed_displacements - displacements_matrix
             add_residual_columns(output_df, disp_forward_res, 'residual_forward_v', 4)
-        
-        if rotations_matrix is not None:
-            if rotation_bias_support is not None:
-                rot_forward_res = recomputed_rotations + rotation_bias_support[np.newaxis, :] - rotations_matrix
-                add_residual_columns(output_df, rot_forward_res, 'residual_forward_theta', len(rotation_bias_support))
+
+        if final_rotations_matrix is not None:
+            if rotation_bias_support_for_output is not None:
+                rot_forward_res = final_recomputed_rotations + rotation_bias_support_for_output[np.newaxis, :] - rotations_matrix
+                add_residual_columns(output_df, rot_forward_res, 'residual_forward_theta', len(rotation_bias_support_for_output))
             else:
-                rot_forward_res = recomputed_rotations - rotations_matrix
+                rot_forward_res = final_recomputed_rotations - final_rotations_matrix
                 add_residual_columns(output_df, rot_forward_res, 'residual_forward_theta', 4)
-        
-        if span_rotations_matrix is not None:
-            if rotation_bias_span is not None:
-                span_rot_forward_res = recomputed_span_rotations + rotation_bias_span[np.newaxis, :] - span_rotations_matrix
-                add_residual_columns(output_df, span_rot_forward_res, 'residual_forward_span_theta', len(rotation_bias_span))
+
+        if final_span_rotations_matrix is not None:
+            if rotation_bias_span_for_output is not None:
+                span_rot_forward_res = final_recomputed_span_rotations + rotation_bias_span_for_output[np.newaxis, :] - span_rotations_matrix
+                add_residual_columns(output_df, span_rot_forward_res, 'residual_forward_span_theta', len(rotation_bias_span_for_output))
             else:
-                span_rot_forward_res = recomputed_span_rotations - span_rotations_matrix
+                span_rot_forward_res = final_recomputed_span_rotations - final_span_rotations_matrix
                 add_residual_columns(output_df, span_rot_forward_res, 'residual_forward_span_theta', 3)
 
-        
+
         output_df.to_csv(args.output, index=False)
         print(f"\n结果已保存到: {args.output}")
         print(f"\n输出文件包含:")
         print(f"  - 拟合的结构参数 (11个)")
         print(f"  - 拟合的温度参数 (每工况 {actual_segments} 个)")
         print(f"  - 正模型重算的响应 (反力、位移、转角、跨中转角)")
-        print(f"  - 优化器残差 ({measurement_config.describe()})")
+        print(f"  - 优化器残差 ({final_measurement_config.describe()})")
         print(f"  - 正模型残差 (用于验证)")
 
 
