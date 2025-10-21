@@ -77,6 +77,13 @@ def print_fitting_results(
           f"{const_params['kv_factor_b']:.4f}, "
           f"{const_params['kv_factor_c']:.4f}, "
           f"{const_params['kv_factor_d']:.4f})")
+
+    rotation_biases = result.get('rotation_biases')
+    rotation_bias_labels = result.get('rotation_bias_labels') or []
+    if rotation_biases is not None and len(rotation_bias_labels) == len(rotation_biases):
+        print(f"\n拟合的转角偏差 (rad):")
+        for label, bias in zip(rotation_bias_labels, rotation_biases):
+            print(f"  {label}: {bias:+.6e}")
     
     true_settlements, true_ei, true_kv = extract_true_parameters(const_params)
     fitted_settlements = np.array(sp.settlements)
@@ -136,10 +143,16 @@ def print_fitting_results(
     
     if rotations_matrix is not None:
         rot_forward_res = recomputed_rotations - rotations_matrix
+        if rotation_biases is not None and fitter._rotation_bias_support_count:
+            bias_support = rotation_biases[:fitter._rotation_bias_support_count]
+            rot_forward_res = recomputed_rotations + bias_support[np.newaxis, :] - rotations_matrix
         print_residual_stats(rot_forward_res, "转角", "rad")
     
     if span_rotations_matrix is not None:
         span_rot_forward_res = recomputed_span_rotations - span_rotations_matrix
+        if rotation_biases is not None and fitter._rotation_bias_span_count:
+            bias_span = rotation_biases[fitter._rotation_bias_support_count:]
+            span_rot_forward_res = recomputed_span_rotations + bias_span[np.newaxis, :] - span_rotations_matrix
         print_residual_stats(span_rot_forward_res, "跨中转角", "rad")
     
     if result['reaction_residuals'] is not None:

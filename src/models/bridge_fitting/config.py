@@ -8,7 +8,9 @@ class ColumnNames:
     REACTIONS = ['R_a_kN', 'R_b_kN', 'R_c_kN', 'R_d_kN']
     DISPLACEMENTS = ['v_A_mm', 'v_B_mm', 'v_C_mm', 'v_D_mm']
     ROTATIONS = ['theta_A_rad', 'theta_B_rad', 'theta_C_rad', 'theta_D_rad']
+    ROTATIONS_WITH_BIAS = [f'{name}_with_bias' for name in ROTATIONS]
     SPAN_ROTATIONS = ['theta_S1-5_6L_rad', 'theta_S2-4_6L_rad', 'theta_S3-5_6L_rad']
+    SPAN_ROTATIONS_WITH_BIAS = [f'{name}_with_bias' for name in SPAN_ROTATIONS]
     
     TEMPS_3_SPAN = ['dT_s1_C', 'dT_s2_C', 'dT_s3_C']
     TEMPS_2_SEG = ['dT_left_C', 'dT_right_C']
@@ -31,6 +33,8 @@ class OptimizationConfig:
     ei_factor_upper: float = 1.5
     kv_factor_lower: float = 0.1
     kv_factor_upper: float = 3.0
+    rotation_bias_lower: float = -0.05
+    rotation_bias_upper: float = 0.05
     temp_gradient_lower: float = -10.0
     temp_gradient_upper: float = 20.0
     temp_gradient_initial: float = 10.0

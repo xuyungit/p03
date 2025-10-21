@@ -61,6 +61,8 @@ def main():
                         help='跨中转角残差权重 (相对于反力，默认1.0)')
     parser.add_argument('--no-auto-normalize', action='store_true',
                         help='禁用自动归一化（默认启用，基于测量数据标准差归一化）')
+    parser.add_argument('--fit-rotation-bias', action='store_true',
+                        help='同时拟合转角列的全局偏差（每列一个偏差）')
     
     args = parser.parse_args()
     
@@ -83,9 +85,22 @@ def main():
         args.data, args.max_samples, measurement_config
     )
     
-    reactions_matrix, displacements_matrix, rotations_matrix, span_rotations_matrix, measurement_config = setup_measurement_matrices(
-        df, measurement_config
-    )
+    try:
+        (
+            reactions_matrix,
+            displacements_matrix,
+            rotations_matrix,
+            span_rotations_matrix,
+            measurement_config,
+            rotation_column_labels,
+            span_rotation_column_labels,
+        ) = setup_measurement_matrices(
+            df,
+            measurement_config,
+            use_rotation_bias_columns=args.fit_rotation_bias,
+        )
+    except KeyError as exc:
+        raise SystemExit(str(exc)) from exc
     
     requested_segments = int(args.temp_segments)
     if requested_segments == 3:
@@ -153,6 +168,9 @@ def main():
         rotations_matrix=rotations_matrix,
         span_rotations_matrix=span_rotations_matrix,
         temperature_basis=temperature_basis,
+        fit_rotation_bias=args.fit_rotation_bias,
+        rotation_column_labels=rotation_column_labels,
+        span_rotation_column_labels=span_rotation_column_labels,
     )
     
     result = fitter.fit(
@@ -171,6 +189,15 @@ def main():
         span_rotations_matrix=span_rotations_matrix,
         fitter=fitter,
     )
+
+    rotation_biases = result.get('rotation_biases')
+    rotation_bias_support = None
+    rotation_bias_span = None
+    if rotation_biases is not None:
+        if fitter._rotation_bias_support_count:
+            rotation_bias_support = rotation_biases[:fitter._rotation_bias_support_count]
+        if fitter._rotation_bias_span_count:
+            rotation_bias_span = rotation_biases[fitter._rotation_bias_support_count:]
     
     if args.output:
         output_df = df.copy()
@@ -202,15 +229,27 @@ def main():
             output_df[f'R_{name}_recomputed_kN'] = recomputed_reactions[:, i]
             output_df[f'v_{name.upper()}_recomputed_mm'] = recomputed_displacements[:, i]
             output_df[f'theta_{name.upper()}_recomputed_rad'] = recomputed_rotations[:, i]
+            if rotation_bias_support is not None and i < len(rotation_bias_support):
+                output_df[f'theta_{name.upper()}_bias_rad'] = rotation_bias_support[i]
+                output_df[f'theta_{name.upper()}_corrected_rad'] = recomputed_rotations[:, i] + rotation_bias_support[i]
         
         span_names = ['S1-5_6L', 'S2-4_6L', 'S3-5_6L']
         for i, name in enumerate(span_names):
             output_df[f'theta_{name}_recomputed_rad'] = recomputed_span_rotations[:, i]
+            if rotation_bias_span is not None and i < len(rotation_bias_span):
+                output_df[f'theta_{name}_bias_rad'] = rotation_bias_span[i]
+                output_df[f'theta_{name}_corrected_rad'] = recomputed_span_rotations[:, i] + rotation_bias_span[i]
         
         add_residual_columns(output_df, result['reaction_residuals'], 'residual_optimizer_R', 4)
         add_residual_columns(output_df, result['displacement_residuals'], 'residual_optimizer_v', 4)
-        add_residual_columns(output_df, result['rotation_residuals'], 'residual_optimizer_theta', 4)
-        add_residual_columns(output_df, result['span_rotation_residuals'], 'residual_optimizer_span_theta', 3)
+        if rotation_bias_support is not None:
+            add_residual_columns(output_df, result['rotation_residuals'], 'residual_optimizer_theta', len(rotation_bias_support))
+        else:
+            add_residual_columns(output_df, result['rotation_residuals'], 'residual_optimizer_theta', 4)
+        if rotation_bias_span is not None:
+            add_residual_columns(output_df, result['span_rotation_residuals'], 'residual_optimizer_span_theta', len(rotation_bias_span))
+        else:
+            add_residual_columns(output_df, result['span_rotation_residuals'], 'residual_optimizer_span_theta', 3)
         
         add_residual_columns(output_df, reaction_forward_res, 'residual_forward_R', 4)
         
@@ -219,12 +258,21 @@ def main():
             add_residual_columns(output_df, disp_forward_res, 'residual_forward_v', 4)
         
         if rotations_matrix is not None:
-            rot_forward_res = recomputed_rotations - rotations_matrix
-            add_residual_columns(output_df, rot_forward_res, 'residual_forward_theta', 4)
+            if rotation_bias_support is not None:
+                rot_forward_res = recomputed_rotations + rotation_bias_support[np.newaxis, :] - rotations_matrix
+                add_residual_columns(output_df, rot_forward_res, 'residual_forward_theta', len(rotation_bias_support))
+            else:
+                rot_forward_res = recomputed_rotations - rotations_matrix
+                add_residual_columns(output_df, rot_forward_res, 'residual_forward_theta', 4)
         
         if span_rotations_matrix is not None:
-            span_rot_forward_res = recomputed_span_rotations - span_rotations_matrix
-            add_residual_columns(output_df, span_rot_forward_res, 'residual_forward_span_theta', 3)
+            if rotation_bias_span is not None:
+                span_rot_forward_res = recomputed_span_rotations + rotation_bias_span[np.newaxis, :] - span_rotations_matrix
+                add_residual_columns(output_df, span_rot_forward_res, 'residual_forward_span_theta', len(rotation_bias_span))
+            else:
+                span_rot_forward_res = recomputed_span_rotations - span_rotations_matrix
+                add_residual_columns(output_df, span_rot_forward_res, 'residual_forward_span_theta', 3)
+
         
         output_df.to_csv(args.output, index=False)
         print(f"\n结果已保存到: {args.output}")

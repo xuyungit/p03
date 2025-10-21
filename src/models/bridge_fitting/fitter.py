@@ -15,7 +15,7 @@ from models.bridge_forward_model import (
     H_MM,
 )
 
-from .config import MeasurementConfig, OptimizationConfig
+from .config import ColumnNames, MeasurementConfig, OptimizationConfig
 from .temperature_models import RawTemperatureBasis, TemperatureBasis
 
 
@@ -101,6 +101,9 @@ class VectorizedMultiCaseFitter:
         span_rotations_matrix: Optional[np.ndarray] = None,
         opt_config: Optional[OptimizationConfig] = None,
         temperature_basis: Optional[TemperatureBasis] = None,
+        fit_rotation_bias: bool = False,
+        rotation_column_labels: Optional[list[str]] = None,
+        span_rotation_column_labels: Optional[list[str]] = None,
     ):
         self.reactions_matrix = reactions_matrix
         self.n_cases = reactions_matrix.shape[0]
@@ -128,6 +131,31 @@ class VectorizedMultiCaseFitter:
         self.displacements_matrix = displacements_matrix
         self.rotations_matrix = rotations_matrix
         self.span_rotations_matrix = span_rotations_matrix
+
+        self._rotation_measurement_labels: list[str] = []
+        if self.measurement_config.use_rotations:
+            if rotation_column_labels:
+                self._rotation_measurement_labels = list(rotation_column_labels)
+            else:
+                self._rotation_measurement_labels = list(ColumnNames.ROTATIONS)
+
+        self._span_rotation_measurement_labels: list[str] = []
+        if self.measurement_config.use_span_rotations:
+            if span_rotation_column_labels:
+                self._span_rotation_measurement_labels = list(span_rotation_column_labels)
+            else:
+                self._span_rotation_measurement_labels = list(ColumnNames.SPAN_ROTATIONS)
+
+        self._rotation_bias_labels: list[str] = []
+        if self.measurement_config.use_rotations:
+            self._rotation_bias_labels.extend(self._rotation_measurement_labels)
+        if self.measurement_config.use_span_rotations:
+            self._rotation_bias_labels.extend(self._span_rotation_measurement_labels)
+
+        self._rotation_bias_support_count = len(self._rotation_measurement_labels)
+        self._rotation_bias_span_count = len(self._span_rotation_measurement_labels)
+        self._rotation_bias_count = len(self._rotation_bias_labels)
+        self._fit_rotation_bias = fit_rotation_bias and self._rotation_bias_count > 0
         
         if measurement_config.use_displacements and displacements_matrix is None:
             raise ValueError("displacements_matrix required when use_displacements=True")
@@ -188,6 +216,9 @@ class VectorizedMultiCaseFitter:
         print(f"  沉降参数: {settlement_status}")
         print(f"  优化特性: 批量求解 + 向量化温度载荷 (nT={self.temp_segments})")
         print(f"  温度参数化: {self.temperature_basis.describe()}")
+        if self._rotation_bias_count:
+            bias_status = "启用" if self._fit_rotation_bias else "禁用"
+            print(f"  转角偏差参数: {bias_status} ({self._rotation_bias_count} 列)")
         
         if measurement_config.auto_normalize:
             print(f"\n归一化标度 (基于测量数据的标准差):")
@@ -225,6 +256,11 @@ class VectorizedMultiCaseFitter:
                 x0_list.extend([1.0, 1.0, 1.0, 1.0])
                 lower_list.extend([self.opt_config.kv_factor_lower] * 4)
                 upper_list.extend([self.opt_config.kv_factor_upper] * 4)
+
+        if self._fit_rotation_bias:
+            x0_list.extend([0.0] * self._rotation_bias_count)
+            lower_list.extend([self.opt_config.rotation_bias_lower] * self._rotation_bias_count)
+            upper_list.extend([self.opt_config.rotation_bias_upper] * self._rotation_bias_count)
         
         temp_init = self.temperature_basis.initial(self.opt_config)
         temp_lower, temp_upper = self.temperature_basis.bounds(self.opt_config)
@@ -240,10 +276,13 @@ class VectorizedMultiCaseFitter:
         n_ei = 3 if fit_struct else 0
         n_kv = 0 if (not fit_struct or self.fixed_kv_factors is not None) else 4
         n_struct = n_settlement + n_ei + n_kv
+        n_rotation_bias = self._rotation_bias_count if self._fit_rotation_bias else 0
         n_temp = self.temperature_basis.num_params()
         
         print(f"\n参数空间:")
         print(f"  结构参数: {n_struct} (沉降: {n_settlement}, EI: {n_ei}, KV: {n_kv})")
+        if n_rotation_bias:
+            print(f"  转角偏差: {n_rotation_bias} ({', '.join(self._rotation_bias_labels)})")
         print(f"  温度参数: {n_temp} ({self.temperature_basis.describe()})")
         print(f"  总参数数: {len(x0)}")
         
@@ -253,8 +292,8 @@ class VectorizedMultiCaseFitter:
         self,
         x: np.ndarray,
         fit_struct: bool = True,
-    ) -> Tuple[StructuralParams, np.ndarray]:
-        """Unpack parameters into StructuralParams and temperature matrix."""
+    ) -> Tuple[StructuralParams, Optional[np.ndarray], np.ndarray]:
+        """Unpack parameters into StructuralParams, rotation bias vector, and temperature matrix."""
         idx = 0
         
         if fit_struct:
@@ -277,7 +316,7 @@ class VectorizedMultiCaseFitter:
             settlements = (0.0, 0.0, 0.0, 0.0)
             ei_factors = (1.0, 1.0, 1.0)
             kv_factors = self.fixed_kv_factors if self.fixed_kv_factors is not None else (1.0, 1.0, 1.0, 1.0)
-        
+
         struct_params = StructuralParams(
             settlements=settlements,  # type: ignore[arg-type]
             ei_factors=ei_factors,  # type: ignore[arg-type]
@@ -285,10 +324,16 @@ class VectorizedMultiCaseFitter:
             uniform_load=self.uniform_load,
             ne_per_span=self.ne_per_span,
         )
-        
+
+        if self._fit_rotation_bias:
+            rotation_biases = np.array(x[idx:idx + self._rotation_bias_count])
+            idx += self._rotation_bias_count
+        else:
+            rotation_biases = None
+
         dT_matrix = self.temperature_basis.expand(x[idx:])
-        
-        return struct_params, dT_matrix
+
+        return struct_params, rotation_biases, dT_matrix
     
     def _get_or_assemble_system(self, struct_params: StructuralParams) -> StructuralSystem:
         """Get cached system or assemble new one."""
@@ -317,7 +362,7 @@ class VectorizedMultiCaseFitter:
         """Vectorized residual computation with auto-normalization."""
         self._n_residual_calls += 1
         
-        struct_params, dT_matrix = self._unpack_params(x, fit_struct)
+        struct_params, rotation_biases, dT_matrix = self._unpack_params(x, fit_struct)
         system = self._get_or_assemble_system(struct_params)
         
         _, reactions_all, displacements_all, rotations_all, span_rotations_all = batch_solve_with_system(
@@ -337,12 +382,20 @@ class VectorizedMultiCaseFitter:
             residuals_list.append(displacement_residuals)
         
         if self.measurement_config.use_rotations:
-            rotation_residuals = (rotations_all - self.rotations_matrix).ravel()
+            rotation_adjusted = rotations_all
+            if rotation_biases is not None and self._rotation_bias_support_count:
+                rotation_bias_support = rotation_biases[:self._rotation_bias_support_count]
+                rotation_adjusted = rotations_all + rotation_bias_support[np.newaxis, :]
+            rotation_residuals = (rotation_adjusted - self.rotations_matrix).ravel()
             rotation_residuals = (rotation_residuals / self.rotation_scale) * self.measurement_config.rotation_weight
             residuals_list.append(rotation_residuals)
         
         if self.measurement_config.use_span_rotations:
-            span_rotation_residuals = (span_rotations_all - self.span_rotations_matrix).ravel()
+            span_adjusted = span_rotations_all
+            if rotation_biases is not None and self._rotation_bias_span_count:
+                span_bias = rotation_biases[self._rotation_bias_support_count:]
+                span_adjusted = span_rotations_all + span_bias[np.newaxis, :]
+            span_rotation_residuals = (span_adjusted - self.span_rotations_matrix).ravel()
             span_rotation_residuals = (span_rotation_residuals / self.span_rotation_scale) * self.measurement_config.span_rotation_weight
             residuals_list.append(span_rotation_residuals)
         
@@ -418,7 +471,7 @@ class VectorizedMultiCaseFitter:
             verbose=verbose,
         )
         
-        struct_params, dT_matrix = self._unpack_params(result.x, fit_struct)
+        struct_params, rotation_biases, dT_matrix = self._unpack_params(result.x, fit_struct)
         temp_param_count = self.temperature_basis.num_params()
         temperature_params = result.x[-temp_param_count:].copy()
         thermal_states = [ThermalState(dT_spans=tuple(row)) for row in dT_matrix]  # type: ignore[arg-type]
@@ -429,8 +482,22 @@ class VectorizedMultiCaseFitter:
         
         reaction_residuals = reactions_all - self.reactions_matrix if self.measurement_config.use_reactions else None
         displacement_residuals = displacements_all - self.displacements_matrix if self.measurement_config.use_displacements else None
-        rotation_residuals = rotations_all - self.rotations_matrix if self.measurement_config.use_rotations else None
-        span_rotation_residuals = span_rotations_all - self.span_rotations_matrix if self.measurement_config.use_span_rotations else None
+        rotation_residuals = None
+        span_rotation_residuals = None
+
+        if self.measurement_config.use_rotations and self.rotations_matrix is not None:
+            rotation_adjusted = rotations_all
+            if rotation_biases is not None and self._rotation_bias_support_count:
+                rotation_bias_support = rotation_biases[:self._rotation_bias_support_count]
+                rotation_adjusted = rotations_all + rotation_bias_support[np.newaxis, :]
+            rotation_residuals = rotation_adjusted - self.rotations_matrix
+        
+        if self.measurement_config.use_span_rotations and self.span_rotations_matrix is not None:
+            span_adjusted = span_rotations_all
+            if rotation_biases is not None and self._rotation_bias_span_count:
+                span_bias = rotation_biases[self._rotation_bias_support_count:]
+                span_adjusted = span_rotations_all + span_bias[np.newaxis, :]
+            span_rotation_residuals = span_adjusted - self.span_rotations_matrix
         
         print(f"\n性能统计:")
         print(f"  残差函数调用次数: {self._n_residual_calls}")
@@ -451,6 +518,8 @@ class VectorizedMultiCaseFitter:
             'displacements_computed': displacements_all,
             'rotations_computed': rotations_all,
             'span_rotations_computed': span_rotations_all,
+            'rotation_biases': rotation_biases,
+            'rotation_bias_labels': self._rotation_bias_labels,
             'cost': result.cost,
             'optimality': result.optimality,
             'nfev': result.nfev,
